@@ -20,6 +20,12 @@ When a pawn moves to the end of the board using a Category A move, it's assumed 
 
 Total: 73 movements
 
+## Action Space (probably better)
+8 x 8 x 5
+The first two channels represent the start position and end position of the piece. The last 3 channels represent the underpromotion type, and are either filled with ones if it underpromoted to that piece or 0s otherwise.
+We can easily tack these 5 channels onto the latent state and provide to the dynamics function.
+
+
 ## Observation Space
 8 x 8 x 119 channels
 
@@ -50,6 +56,23 @@ Total move count: encoded as a number from 0.0 to 1.0, either by dividing by a m
 H: s_t = H(o_t)
 
 Outputs the latent state given an observation. 
+
+Takes our 8x8x119 observation and outputs latent state with our chosen shape 8x8x256. This shape allows us to use the first two dimensions to represent the 8x8 board and the third dimension is channels that represent concepts for each cell in the board, such as white's bishops' level of control over that cell.
+
+First:
+Apply a 3x3x119x256 conv layer to convert 8x8x119 observation into the shape of our latent state (8x8x256).
+Then, stack a bunch of ResNet modules on top of each other to keep iterating on the values while preserving our 8x8x256 shape until we get to our final output.
+
+ResNet:
+Input: 8x8x256
+1. Apply the first 3×3×256×256 convolution.
+2. Apply Batch Normalization and ReLU.
+3. Apply a second 3×3×256×256 convolution.
+4. Apply Batch Normalization.
+5. The Skip Connection: Take the original 8×8×256 tensor that entered the block and mathematically add it to the output of step 4.
+6. Apply a final ReLU.
+Output: 8x8x256
+
 
 ### Dynamic Function
 G: s_t+1, r_t = G(s_t, a_t)
