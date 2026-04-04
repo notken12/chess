@@ -1,3 +1,4 @@
+import threading
 from typing import List, cast
 import torch
 import numpy as np
@@ -100,7 +101,17 @@ action_space_size = 8 * 8 * 73
 value_bins = torch.linspace(-1, 1, 10)
 reward_bins = torch.tensor([-1, 0, 1])
 
-rng = np.random.default_rng()
+# Each thread gets its own RNG so parallel reanalysis workers don't corrupt
+# each other's random state.
+_thread_local = threading.local()
+
+
+def _rng() -> np.random.Generator:
+    if not hasattr(_thread_local, "rng"):
+        _thread_local.rng = np.random.default_rng()
+    return _thread_local.rng
+
+
 gamma = 1
 
 
@@ -118,7 +129,7 @@ def get_target_policy(cur_latent: torch.Tensor, cur_policy_logits: torch.Tensor)
         q_value_min_max,
     )
     # sample Gumbel top K here and add as child nodes
-    gumbel_noise = torch.from_numpy(rng.gumbel(size=action_space_size))
+    gumbel_noise = torch.from_numpy(_rng().gumbel(size=action_space_size))
     samples = gumbel_noise + cur_policy_logits
     k = 16
     top_k_idx = np.argpartition(samples, -k)[-k:]
@@ -155,7 +166,7 @@ def get_target_policy(cur_latent: torch.Tensor, cur_policy_logits: torch.Tensor)
             action_idx
         ] + root_node.sigma(completedQ)
     target_policy = torch.softmax(target_policy, dim=0)
-    return root_action, target_policy
+    return root_action, target_policy, root_node.average_value
 
 
 def simulate(root_node: TreeNode):
@@ -180,10 +191,10 @@ def simulate(root_node: TreeNode):
                 q_value = torch.sum(cur_node.value_pred * value_bins).item()
                 for i in range(len(search_path) - 1, -1, -1):
                     node = search_path[i]
-                    q_value = (
-                        torch.sum(node.reward_pred * reward_bins).item()
-                        + gamma * q_value
-                    )
+                    immediate_reward=torch.sum(node.reward_pred * reward_bins).item()
+                    # crucially, we subtract the q value of the child node because it belongs to the opponent
+                    # and we want to minimize the opponent's reward (negamax)
+                    q_value = immediate_reward - gamma*q_value
                     new_average = (node.num_visits * node.average_value + q_value) / (
                         node.num_visits + 1
                     )
@@ -200,7 +211,7 @@ def simulate(root_node: TreeNode):
                         )
 
                 # sample Gumbel top K here and add as child nodes
-                gumbel_noise = torch.from_numpy(rng.gumbel(size=action_space_size))
+                gumbel_noise = torch.from_numpy(_rng().gumbel(size=action_space_size))
                 samples = gumbel_noise + cur_node.policy_logits
                 k = 10
                 top_k_idx = np.argpartition(samples, -k)[-k:]
