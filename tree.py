@@ -98,7 +98,7 @@ class TreeNode:
 
 
 action_space_size = 8 * 8 * 73
-value_bins = torch.linspace(-1, 1, 10)
+value_bins = torch.linspace(-1, 1, 51)
 reward_bins = torch.tensor([-1, 0, 1])
 
 # Each thread gets its own RNG so parallel reanalysis workers don't corrupt
@@ -118,18 +118,18 @@ gamma = 1
 # first we make a overall root that represents the current state
 # then we sample a K root actions and attach them to the overall root
 # then we run sequential halving rounds to eliminate half of those root actions each time and double our num simulations
-def get_target_policy(cur_latent: torch.Tensor, cur_policy_logits: torch.Tensor):
+def get_target_policy(cur_latent: torch.Tensor, cur_policy_logits: torch.Tensor, models: dict):
     q_value_min_max = MinMaxStats()
     root_node = TreeNode(
         action_space_size,
         cur_latent,
         cur_policy_logits,
-        torch.zeros([10]),
+        torch.zeros([51]), 
         torch.zeros([3]),
         q_value_min_max,
     )
     # sample Gumbel top K here and add as child nodes
-    gumbel_noise = torch.from_numpy(_rng().gumbel(size=action_space_size))
+    gumbel_noise = torch.from_numpy(_rng().gumbel(size=action_space_size)).to(cur_latent.device)
     samples = gumbel_noise + cur_policy_logits
     k = 16
     top_k_idx = np.argpartition(samples, -k)[-k:]
@@ -144,7 +144,7 @@ def get_target_policy(cur_latent: torch.Tensor, cur_policy_logits: torch.Tensor)
     while remain > 1:
         for r, action_idx in roots:
             for i in range(simulation_budget_per_node):
-                simulate(r)
+                simulate([root_node], action_idx, r, models)
         # eliminate worse half
         roots.sort(key=lambda r: r[0].average_value)
         roots = roots[remain // 2 :]
@@ -169,22 +169,45 @@ def get_target_policy(cur_latent: torch.Tensor, cur_policy_logits: torch.Tensor)
     return root_action, target_policy, root_node.average_value
 
 
-def simulate(root_node: TreeNode):
-    q_value_min_max = root_node.q_value_min_max
+def simulate(prev_path: List[TreeNode], last_action: int, start_node: TreeNode, models: dict):
+    # models: {'representation': ..., 'dynamics': ..., 'policy': ..., 'value': ...}
+    q_value_min_max = start_node.q_value_min_max
+    device = start_node.latent.device
+    v_bins = value_bins.to(device)
+    r_bins = reward_bins.to(device)
     with torch.no_grad():
-        search_path = []  # node
-        cur_node: TreeNode = root_node
+        search_path = list(prev_path)  # node
+        cur_node: TreeNode = start_node
         reached_leaf = False
-        last_action = None
+        last_action = last_action
         while not reached_leaf:
-            if cur_node.num_visits == 0:
+            if cur_node.num_visits == 0:   
                 # this is a leaf
                 # TODO: simulate action via the dynamics function
                 # and get predicted value and reward
-                # cur_node.latent=dynamics_function(search_path[-1].latent, last_action)
-                # cur_node.policy_logits=policy_function(cur_node.latent)
-                # cur_node.value_pred=value_function(cur_node.latent)
-                # cur_node.reward_pred=reward_function(cur_node.latent)
+                # 1. Get the parent and action that led here
+                parent_node, last_action = search_path[-1]
+
+                # 2. Encode the scalar action into a (1, 73, 8, 8) tensor
+                # This matches your Dynamics input: (latent + action_channels)
+                action_one_hot = encode_single_action(last_action, device)
+
+                # 3. Model Inference (Expansion)
+                # next_latent: (1, 256, 8, 8), reward_logits: (1, 3)
+                next_latent, reward_logits = models['dynamics'](parent_node.latent, action_one_hot)
+
+                # 4. Leaf Predictions
+                # policy_logits: (1, 4672), value_logits: (1, 51)
+                policy_logits = models['policy'](next_latent, boards=None)
+                value_logits = models['value'](next_latent)
+
+                # 5. Populate the Leaf Node
+                cur_node.latent = next_latent
+                cur_node.policy_logits = policy_logits.squeeze(0) # Store as (4672,)
+
+                # Convert categorical logits to probability distributions for the backprop
+                cur_node.value_pred = torch.softmax(value_logits, dim=-1).squeeze(0) # (51,)
+                cur_node.reward_pred = torch.softmax(reward_logits, dim=-1).squeeze(0) # (3,)
 
                 # backpropagate to update average_value for this node and parents
                 search_path.append(cur_node)
@@ -211,13 +234,12 @@ def simulate(root_node: TreeNode):
                         )
 
                 # sample Gumbel top K here and add as child nodes
-                gumbel_noise = torch.from_numpy(_rng().gumbel(size=action_space_size))
+                gumbel_noise = torch.from_numpy(_rng().gumbel(size=action_space_size)).to(device)
                 samples = gumbel_noise + cur_node.policy_logits
                 k = 10
-                top_k_idx = np.argpartition(samples, -k)[-k:]
+                top_k_idx = torch.topk(samples, k).indices.cpu().numpy()
                 for action_idx in top_k_idx:
-                    # cur_node.children[action_idx]=TreeNode(action_space_size, )
-                    pass
+                    cur_node.children[action_idx]=TreeNode(action_space_size, None, None, None, None, q_value_min_max   )
 
                 reached_leaf = True
                 break
@@ -227,3 +249,19 @@ def simulate(root_node: TreeNode):
             cur_node = cast(
                 TreeNode, cur_node.children[last_action]
             )  # non-leaf nodes will always have children and only choose actions that are in their children list
+
+def encode_single_action(action_idx: int, device: torch.device):
+    """
+    Hardware adapter: Scalar Index -> 3D One-Hot Tensor
+    """
+    # Create empty action planes
+    action_tensor = torch.zeros((1, 73, 8, 8), device=device)
+    
+    # Use your MOVE_LOOKUP logic to find the coordinates
+    # For example: plane_idx = action_idx // 64; x = (action_idx % 64) // 8; y = action_idx % 8
+    z = action_idx // 64
+    x = (action_idx % 64) // 8
+    y = action_idx % 8
+    
+    action_tensor[0, z, x, y] = 1.0
+    return action_tensor
