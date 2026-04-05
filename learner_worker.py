@@ -28,6 +28,14 @@ class Learner:
         self.policy = policy
         self.value = value
         
+        self.model_dict = {
+            'representation': self.representation,
+            'dynamics': self.dynamics,
+            'policy': self.policy,
+            'value': self.value
+        }
+        self.device = next(self.representation.parameters()).device
+
         # 2. Target Network (The "Stable" Reference for Consistency)
         # We only need the representation head for EfficientZero consistency
         self.target_representation = copy.deepcopy(representation)

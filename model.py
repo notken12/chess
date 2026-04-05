@@ -140,8 +140,6 @@ class Policy(nn.Module):
         self.conv1 = nn.Conv2d(convChannels, actionChannels, kernel_size=1)
         self.bn1 = nn.BatchNorm2d(actionChannels)
 
-    
-
     def createMask(board):
         mask = torch.full((73, 8, 8), -1e9)
     
@@ -163,6 +161,10 @@ class Policy(nn.Module):
         batch_size = logits.size(0)
         logits = logits.view(batch_size, -1)
 
+        if boards is None:
+            # For training targets, we don't need the mask
+            return torch.softmax(logits, dim=1)
+        
         masks = []
         for b in boards:
             m = self.createMask(b).view(-1)

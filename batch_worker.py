@@ -6,6 +6,9 @@ from tensordict import TensorDict
 
 from replay_buffer import K_STEPS, L_STEPS, get_num_episodes, sample_batch
 from tree import get_target_policy, value_bins
+from model import Representation, Dynamics, Policy, Value
+
+
 
 # EfficientZero V2 mixed value target thresholds.
 # Before T1 training steps, the value network is too inaccurate to rely on
@@ -64,22 +67,25 @@ def _build_td_targets(
     return td_targets
 
 
-def provide_batch_transitions(training_step: int) -> TensorDict | None:
+def provide_batch_transitions(training_step: int, models: dict):
     num_games = get_num_episodes()
     if num_games < BATCH_SIZE:
         return None
     batch = sample_batch(batch_size=BATCH_SIZE)
     observations = batch["observations"]  # (B, K+L, 8, 8, 119)
+    # observations shape: (B, K+L, 8, 8, 119)
+    obs_chw = observations.permute(0, 1, 4, 2, 3) 
+    # new shape: (B, K+L, 119, 8, 8)
     rewards = batch["rewards"]  # (B, K+L)
     mask = batch["mask"]  # (B, K+L)
     B = observations.shape[0]
 
     # --- Reanalysis: MCTS on the K unroll steps only ---
-    unroll_obs = observations[:, :K_STEPS]  # (B, K, 8, 8, 119)
-    unroll_obs_flat = unroll_obs.flatten(0, 1)  # (B*K, 8, 8, 119)
+    unroll_obs = obs_chw[:, :K_STEPS] # (B*K, 119, 8, 8)
+    unroll_obs_flat = unroll_obs.flatten(0,1)
     with torch.no_grad():
-        latents_flat = representation_function(unroll_obs_flat)  # (B*K, 8, 8, 256)
-        logits_flat = policy_function(latents_flat)  # (B*K, A)
+        latents_flat = models['representation'](unroll_obs_flat) # (B*K, 256, 8, 8)
+        logits_flat = models['policy'](latents_flat, boards=None) # (B*K, A)
 
     # Parallel MCTS for all B*K unroll positions.
     # tree.py uses thread-local RNGs so workers don't corrupt each other's state.
@@ -89,22 +95,26 @@ def provide_batch_transitions(training_step: int) -> TensorDict | None:
     target_policies = torch.stack([r.target_policy for r in results]).view(
         B, K_STEPS, -1
     )
-    mcts_values = torch.tensor([r.mcts_value for r in results]).view(B, K_STEPS)
+    mcts_values = torch.tensor([r.mcts_value for r in results], device=observations.device).view(B, K_STEPS)
 
     # --- Bootstrap values: V(s_{t+j+L}) for each unroll position j ---
     # The bootstrap for position j sits at window index j+L, spanning L..K+L-1.
-    boot_obs = observations[:, L_STEPS : K_STEPS + L_STEPS]  # (B, K, 8, 8, 119)
+    boot_obs = obs_chw[:, L_STEPS : K_STEPS + L_STEPS]  # (B, K, 8, 8, 119)
     boot_obs_flat = boot_obs.flatten(0, 1)  # (B*K, 8, 8, 119)
     with torch.no_grad():
-        boot_latents = representation_function(boot_obs_flat)  # (B*K, 8, 8, 256)
-        boot_value_probs = value_function(boot_latents)  # (B*K, num_bins)
+
+        boot_latents = models['representation'](boot_obs_flat) # (B*K, 256, 8, 8)
+        boot_value_logits = models['value'](boot_latents)  # (B*K, num_bins)
+        # Convert bins back to a single scalar value
+        boot_value_probs = torch.softmax(boot_value_logits, dim=-1)
+
     bins = value_bins.to(boot_value_probs.device)
     boot_values_flat = (boot_value_probs * bins).sum(dim=-1)  # (B*K,) expected value
     bootstrap_values = boot_values_flat.view(B, K_STEPS)  # (B, K)
     # Zero out positions where the game had already ended.
     bootstrap_values = bootstrap_values * mask[:, L_STEPS : K_STEPS + L_STEPS]
 
-    td_targets = _build_td_targets(rewards, bootstrap_values)  # (B, K)
+    td_targets = _build_td_targets(rewards[:, :K_STEPS + L_STEPS], bootstrap_values)  # (B, K)
 
     # --- Mixed value target (EfficientZero V2) ---
     #   condition 1 — early training: value net not yet reliable, always use TD
@@ -116,6 +126,7 @@ def provide_batch_transitions(training_step: int) -> TensorDict | None:
 
     target_values = torch.where(use_td, td_targets, mcts_values)  # (B, K)
 
+    batch["observations"] = obs_chw
     batch["target_policies"] = target_policies  # (B, K, A)
     batch["target_values"] = target_values  # (B, K)
     return batch
