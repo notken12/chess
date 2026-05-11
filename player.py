@@ -31,10 +31,10 @@ def play_game() -> List[Step]:
         obs_board = board.mirror() if board.turn == chess.BLACK else board.copy(stack=False)
         board_history.appendleft(obs_board)
         observation = board_to_observation(obs_board, history=list(board_history))
-        latent = representation_function(observation)
-        policy_logits = policy_function(latent)
+        latent = nets.representation(observation.permute(2, 0, 1).unsqueeze(0))
+        policy_logits = nets.policy(latent, boards=None)
         target_action, _target_policy, _target_value = get_target_policy(
-            latent, policy_logits
+            latent, policy_logits, nets
         )
         board.push(action_to_chess_move(target_action, board.turn == chess.BLACK))
         outcome = board.outcome()

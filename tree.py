@@ -36,7 +36,7 @@ class TreeNode:
         self.latent = latent
         self.policy_logits = policy_logits
         self.policy_probs = (
-            torch.softmax(policy_logits, dim=0) if policy_logits else None
+            torch.softmax(policy_logits, dim=0) if policy_logits is not None
         )
         self.value_pred = value_pred
         self.num_visits = num_visits
@@ -118,7 +118,7 @@ gamma = 1
 # first we make a overall root that represents the current state
 # then we sample a K root actions and attach them to the overall root
 # then we run sequential halving rounds to eliminate half of those root actions each time and double our num simulations
-def get_target_policy(cur_latent: torch.Tensor, cur_policy_logits: torch.Tensor, models: dict):
+def get_target_policy(cur_latent: torch.Tensor, cur_policy_logits: torch.Tensor, nets:Networks):
     q_value_min_max = MinMaxStats()
     root_node = TreeNode(
         action_space_size,
@@ -144,7 +144,7 @@ def get_target_policy(cur_latent: torch.Tensor, cur_policy_logits: torch.Tensor,
     while remain > 1:
         for r, action_idx in roots:
             for i in range(simulation_budget_per_node):
-                simulate([root_node], action_idx, r, models)
+                simulate([root_node], action_idx, r, nets)
         # eliminate worse half
         roots.sort(key=lambda r: r[0].average_value)
         roots = roots[remain // 2 :]
@@ -169,7 +169,7 @@ def get_target_policy(cur_latent: torch.Tensor, cur_policy_logits: torch.Tensor,
     return root_action, target_policy, root_node.average_value
 
 
-def simulate(prev_path: List[TreeNode], last_action: int, start_node: TreeNode, models: dict):
+def simulate(prev_path: List[TreeNode], last_action: int, start_node: TreeNode, nets:Networks):
     # models: {'representation': ..., 'dynamics': ..., 'policy': ..., 'value': ...}
     q_value_min_max = start_node.q_value_min_max
     device = start_node.latent.device
@@ -194,12 +194,12 @@ def simulate(prev_path: List[TreeNode], last_action: int, start_node: TreeNode, 
 
                 # 3. Model Inference (Expansion)
                 # next_latent: (1, 256, 8, 8), reward_logits: (1, 3)
-                next_latent, reward_logits = models['dynamics'](parent_node.latent, action_one_hot)
+                next_latent, reward_logits = nets.dynamics(parent_node.latent, action_one_hot)
 
                 # 4. Leaf Predictions
                 # policy_logits: (1, 4672), value_logits: (1, 51)
-                policy_logits = models['policy'](next_latent, boards=None)
-                value_logits = models['value'](next_latent)
+                policy_logits = nets.policy(next_latent, boards=None)
+                value_logits = nets.value(next_latent)
 
                 # 5. Populate the Leaf Node
                 cur_node.latent = next_latent

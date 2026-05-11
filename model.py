@@ -203,4 +203,24 @@ class Value(nn.Module):
         return value_logits
 
                 
-        
+class Networks:
+    self.representation = representation
+    self.dynamics = dynamics
+    self.policy = policy
+    self.value = value
+
+    def to(self, device)
+        for m in (self.representation, self.dynamics, self.policy, self.value):
+            m.to(device)
+        return self
+    def eval(self)
+        for m in (self.representation, self.dynamics, self.policy, self.value):
+            m.eval()
+        return self
+
+  def build_networks(device="cuda"):
+      rep = Representation(obsChannels=119, convChannels=256)
+      dyn = Dynamics(actionChannels=73, stateChannels=256, convChannels=256)
+      pol = Policy(actionChannels=73, convChannels=256)
+      val = Value(convChannels=256, numBins=51)
+      return Networks(rep, dyn, pol, val).to(device)

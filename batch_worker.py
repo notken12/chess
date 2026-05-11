@@ -28,9 +28,9 @@ class _ReanalysisResult(NamedTuple):
     mcts_value: float
 
 
-def _reanalyze(latent: torch.Tensor, policy_logits: torch.Tensor) -> _ReanalysisResult:
+def _reanalyze(latent: torch.Tensor, policy_logits: torch.Tensor, nets: Networks) -> _ReanalysisResult:
     """Run MCTS for one latent state; return the improved policy and root value."""
-    _, target_policy, mcts_value = get_target_policy(latent, policy_logits)
+    _, target_policy, mcts_value = get_target_policy(latent, policy_logits, nets)
     return _ReanalysisResult(target_policy, mcts_value)
 
 
@@ -67,7 +67,7 @@ def _build_td_targets(
     return td_targets
 
 
-def provide_batch_transitions(training_step: int, models: dict):
+def provide_batch_transitions(training_step: int, nets: Networks):
     num_games = get_num_episodes()
     if num_games < BATCH_SIZE:
         return None
@@ -84,14 +84,14 @@ def provide_batch_transitions(training_step: int, models: dict):
     unroll_obs = obs_chw[:, :K_STEPS] # (B*K, 119, 8, 8)
     unroll_obs_flat = unroll_obs.flatten(0,1)
     with torch.no_grad():
-        latents_flat = models['representation'](unroll_obs_flat) # (B*K, 256, 8, 8)
-        logits_flat = models['policy'](latents_flat, boards=None) # (B*K, A)
+        latents_flat = nets.representation(unroll_obs_flat) # (B*K, 256, 8, 8)
+        logits_flat = nets.policy(latents_flat, boards=None) # (B*K, A)
 
     # Parallel MCTS for all B*K unroll positions.
     # tree.py uses thread-local RNGs so workers don't corrupt each other's state.
     with ThreadPoolExecutor() as executor:
-        results = list(executor.map(_reanalyze, latents_flat, logits_flat))
-
+        results = list(executor.map(lambda lp: _reanalyze(lp[0], lp[1], nets),
+                                  zip(latents_flat, logits_flat)))
     target_policies = torch.stack([r.target_policy for r in results]).view(
         B, K_STEPS, -1
     )
@@ -103,8 +103,8 @@ def provide_batch_transitions(training_step: int, models: dict):
     boot_obs_flat = boot_obs.flatten(0, 1)  # (B*K, 8, 8, 119)
     with torch.no_grad():
 
-        boot_latents = models['representation'](boot_obs_flat) # (B*K, 256, 8, 8)
-        boot_value_logits = models['value'](boot_latents)  # (B*K, num_bins)
+        boot_latents = nets.representation(boot_obs_flat) # (B*K, 256, 8, 8)
+        boot_value_logits = nets.value(boot_latents)  # (B*K, num_bins)
         # Convert bins back to a single scalar value
         boot_value_probs = torch.softmax(boot_value_logits, dim=-1)
 

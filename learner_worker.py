@@ -27,7 +27,13 @@ class Learner:
         self.dynamics = dynamics
         self.policy = policy
         self.value = value
-        
+        self.nets = Networks(
+            representation
+            dynamics,
+            policy,
+            value
+        )
+
         self.model_dict = {
             'representation': self.representation,
             'dynamics': self.dynamics,
@@ -58,7 +64,7 @@ class Learner:
         self.index_to_coord = {v[0]: (v[0], v[1], v[2]) for k, v in MOVE_LOOKUP.items()}
 
     def update_step(self, batch, training_step):
-        #batch = provide_batch_transitions(training_step, self.model_dict)
+        batch = provide_batch_transitions(training_step, self.nets)
         if batch is None: return
         
         # Move batch to the correct device (GPU/CPU)
