@@ -1,7 +1,10 @@
 import threading
-from typing import List, cast
+from typing import List, cast, TYPE_CHECKING
 import torch
 import numpy as np
+
+if TYPE_CHECKING:
+    from model import Networks
 
 
 class MinMaxStats:
@@ -118,7 +121,7 @@ gamma = 1
 # first we make a overall root that represents the current state
 # then we sample a K root actions and attach them to the overall root
 # then we run sequential halving rounds to eliminate half of those root actions each time and double our num simulations
-def get_target_policy(cur_latent: torch.Tensor, cur_policy_logits: torch.Tensor, nets:Networks):
+def get_target_policy(cur_latent: torch.Tensor, cur_policy_logits: torch.Tensor, nets: "Networks"):
     q_value_min_max = MinMaxStats()
     root_node = TreeNode(
         action_space_size,
@@ -169,7 +172,7 @@ def get_target_policy(cur_latent: torch.Tensor, cur_policy_logits: torch.Tensor,
     return root_action, target_policy, root_node.average_value
 
 
-def simulate(prev_path: List[TreeNode], last_action: int, start_node: TreeNode, nets:Networks):
+def simulate(prev_path: List[TreeNode], last_action: int, start_node: TreeNode, nets: "Networks"):
     # models: {'representation': ..., 'dynamics': ..., 'policy': ..., 'value': ...}
     q_value_min_max = start_node.q_value_min_max
     device = start_node.latent.device
