@@ -140,18 +140,17 @@ class Policy(nn.Module):
         self.conv1 = nn.Conv2d(convChannels, actionChannels, kernel_size=1)
         self.bn1 = nn.BatchNorm2d(actionChannels)
 
+    @staticmethod
+    # Iterate through legal moves    
     def createMask(board):
         mask = torch.full((73, 8, 8), -1e9)
-    
-        # Iterate through legal moves
         for move in board.legal_moves:
             uci = move.uci()
             if uci in MOVE_LOOKUP:
                 z, x, y = MOVE_LOOKUP[uci]
-                mask[z, x, y] = 0
+                mask[z, x, y] = 0.0
             else:
                 print(f"Warning: Move {uci} not found in lookup table.")
-                
         return mask
 
     def forward(self, x, boards):
@@ -162,19 +161,11 @@ class Policy(nn.Module):
         logits = logits.view(batch_size, -1)
 
         if boards is None:
-            # For training targets, we don't need the mask
-            return torch.softmax(logits, dim=1)
-        
-        masks = []
-        for b in boards:
-            m = self.createMask(b).view(-1)
-            masks.append(m)
+            return logits
 
+        masks = [self.createMask(b).view(-1) for b in boards]
         mask_stack = torch.stack(masks).to(logits.device)
-        masked_logits = logits + mask_stack
-        probs = torch.softmax(masked_logits, dim=1)
-
-        return probs
+        return logits + mask_stack
 
 class Value(nn.Module):
     def __init__(self, convChannels, numBins): # convChannels=256, numBins

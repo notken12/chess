@@ -80,15 +80,12 @@ class Learner:
             for k in range(K_STEPS):
                 # --- Predictions ---
                 pred_value_logits = self.value(latent)
-                # Note: Policy requires board objects for masking in your implementation
-                # If boards are not in batch, you'd use a raw policy head here
-                pred_policy_probs = self.policy(latent, batch["boards"][k])
-                
-                # --- Losses ---
+                pred_policy_logits = self.policy(latent, boards=None)
+
                 target_policy = batch["target_policies"][:, k]
                 target_value = batch["target_values"][:, k]
-                
-                p_loss = self.compute_policy_loss(pred_policy_probs, target_policy)
+
+                p_loss = self.compute_policy_loss(pred_policy_logits, target_policy)
                 v_loss = self.compute_value_loss(pred_value_logits, target_value)
                 total_loss += (p_loss + v_loss)
 
@@ -126,8 +123,8 @@ class Learner:
 
     # --- Loss Helper Functions ---
     
-    def compute_policy_loss(self, pred_probs, target_policy):
-        return -(target_policy * torch.log(pred_probs + 1e-8)).sum(dim=1).mean()
+    def compute_policy_loss(self, pred_logits, target_policy):
+        return -(target_policy * F.log_softmax(pred_logits, dim=1)).sum(dim=1).mean()
 
     def compute_value_loss(self, pred_logits, target_value):
         target_dist = self.scalar_to_categorical(target_value)

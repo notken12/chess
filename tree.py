@@ -36,7 +36,7 @@ class TreeNode:
         self.latent = latent
         self.policy_logits = policy_logits
         self.policy_probs = (
-            torch.softmax(policy_logits, dim=0) if policy_logits is not None
+            torch.softmax(policy_logits, dim=0) if policy_logits is not None else None
         )
         self.value_pred = value_pred
         self.num_visits = num_visits
@@ -132,7 +132,7 @@ def get_target_policy(cur_latent: torch.Tensor, cur_policy_logits: torch.Tensor,
     gumbel_noise = torch.from_numpy(_rng().gumbel(size=action_space_size)).to(cur_latent.device)
     samples = gumbel_noise + cur_policy_logits
     k = 16
-    top_k_idx = np.argpartition(samples, -k)[-k:]
+    top_k_idx = np.argpartition(samples.detach().cpu().numpy(), -k)[-k:]    
     roots = []
     for action_idx in top_k_idx:
         node = TreeNode(action_space_size, None, None, None, None, q_value_min_max)
@@ -186,7 +186,7 @@ def simulate(prev_path: List[TreeNode], last_action: int, start_node: TreeNode, 
                 # TODO: simulate action via the dynamics function
                 # and get predicted value and reward
                 # 1. Get the parent and action that led here
-                parent_node, last_action = search_path[-1]
+                parent_node = search_path[-1]
 
                 # 2. Encode the scalar action into a (1, 73, 8, 8) tensor
                 # This matches your Dynamics input: (latent + action_channels)
@@ -217,12 +217,14 @@ def simulate(prev_path: List[TreeNode], last_action: int, start_node: TreeNode, 
                     immediate_reward=torch.sum(node.reward_pred * reward_bins).item()
                     # crucially, we subtract the q value of the child node because it belongs to the opponent
                     # and we want to minimize the opponent's reward (negamax)
-                    q_value = immediate_reward - gamma*q_value
                     new_average = (node.num_visits * node.average_value + q_value) / (
                         node.num_visits + 1
                     )
                     node.average_value = new_average
                     node.num_visits += 1
+
+                    q_value = immediate_reward - gamma*q_value
+                    
                     q_value_min_max.update(q_value)
 
                     if i > 0 and (
