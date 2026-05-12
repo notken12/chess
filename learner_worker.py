@@ -14,10 +14,10 @@ from concurrent.futures import ThreadPoolExecutor
 import time
 import copy  
 
-from model import Representation, Dynamics, Policy, Value
+from model import Representation, Dynamics, Policy, Value, Networks
 from batch_worker import provide_batch_transitions
 from replay_buffer import sample_batch, K_STEPS, L_STEPS
-from tree import MOVE_LOOKUP, value_bins  # For move encoding and categorical support
+from tree import value_bins  # For categorical support
 
 
 class Learner:
@@ -28,18 +28,12 @@ class Learner:
         self.policy = policy
         self.value = value
         self.nets = Networks(
-            representation
+            representation,
             dynamics,
             policy,
-            value
+            value,
         )
 
-        self.model_dict = {
-            'representation': self.representation,
-            'dynamics': self.dynamics,
-            'policy': self.policy,
-            'value': self.value
-        }
         self.device = next(self.representation.parameters()).device
 
         # 2. Target Network (The "Stable" Reference for Consistency)
@@ -48,36 +42,32 @@ class Learner:
         self.target_representation.requires_grad_(False)
         
         # 3. Optimization Setup
-        # We group all parameters so the optimizer can update the whole "brain" at once
         self.optimizer = optim.Adam(
             list(self.representation.parameters()) + 
             list(self.dynamics.parameters()) + 
             list(self.policy.parameters()) + 
             list(self.value.parameters()), 
-            lr=lr
+            lr=lr,
         )
-        self.scaler = torch.amp.GradScaler(device_type='cuda') # For Mixed Precision (FP16)
         
         # 4. Helper Metadata
-        self.value_bins = value_bins # torch.linspace(-1, 1, num_bins)
-        # Invert the MOVE_LOOKUP for fast action encoding
-        self.index_to_coord = {v[0]: (v[0], v[1], v[2]) for k, v in MOVE_LOOKUP.items()}
+        self.value_bins = value_bins  # torch.linspace(-1, 1, num_bins)
 
     def update_step(self, batch, training_step):
         batch = provide_batch_transitions(training_step, self.nets)
-        if batch is None: return
+        if batch is None:
+            return
         
-        # Move batch to the correct device (GPU/CPU)
-        batch = batch.to(next(self.representation.parameters()).device)
+        batch = batch.to(self.device)
 
-        with torch.amp.autocast(device_type='cuda'):
-            obs_0 = batch["observations"][:, 0].permute(0, 3, 1, 2)
-            latent = self.representation(obs_0)
-            
-            total_loss = 0
-            
-            # Unroll Loop for BPTT
-            for k in range(K_STEPS):
+        # Batch worker already permuted observations to (B, K+L, 119, 8, 8)
+        obs_0 = batch["observations"][:, 0]
+        latent = self.representation(obs_0)
+        
+        total_loss = torch.tensor(0.0, device=self.device)
+        
+        # Unroll Loop for BPTT
+        for k in range(K_STEPS):
                 # --- Predictions ---
                 pred_value_logits = self.value(latent)
                 pred_policy_logits = self.policy(latent, boards=None)
@@ -102,7 +92,7 @@ class Learner:
                     r_loss = self.compute_reward_loss(pred_reward_logits, target_reward)
                     
                     # Consistency Loss (Grounding the dream)
-                    real_obs_k = batch["observations"][:, k+1].permute(0, 3, 1, 2)
+                    real_obs_k = batch["observations"][:, k+1]
                     with torch.no_grad():
                         real_latent = self.target_representation(real_obs_k)
                     
@@ -114,9 +104,8 @@ class Learner:
 
         # Optimization Step
         self.optimizer.zero_grad()
-        self.scaler.scale(total_loss).backward()
-        self.scaler.step(self.optimizer)
-        self.scaler.update()
+        total_loss.backward()
+        self.optimizer.step()
 
         # Slowly move the target network toward the live network
         self.update_target_network()
@@ -148,9 +137,10 @@ class Learner:
         action_tensor = torch.zeros((B, 73, 8, 8), device=action_indices.device)
         for b in range(B):
             idx = action_indices[b].item()
-            if idx in self.index_to_coord:
-                z, x, y = self.index_to_coord[idx]
-                action_tensor[b, z, x, y] = 1.0
+            z = idx // 64
+            x = (idx % 64) // 8
+            y = idx % 8
+            action_tensor[b, z, x, y] = 1.0
         return action_tensor
 
     def scalar_to_categorical(self, v):
@@ -159,9 +149,9 @@ class Learner:
         bin_width = self.value_bins[1] - self.value_bins[0]
         centered_v = (v - self.value_bins[0]) / bin_width
         low = centered_v.floor().long()
-        high = (low + 1).clamp(0, len(self.value_bins)-1)
+        high = (low + 1).clamp(0, len(self.value_bins) - 1)
         w_high = centered_v - low
         dist = torch.zeros((v.size(0), len(self.value_bins)), device=v.device)
-        dist.scatter_(1, low.unsqueeze(1).clamp(0, len(self.value_bins)-1), (1-w_high).unsqueeze(1))
+        dist.scatter_(1, low.unsqueeze(1).clamp(0, len(self.value_bins) - 1), (1 - w_high).unsqueeze(1))
         dist.scatter_(1, high.unsqueeze(1), w_high.unsqueeze(1))
         return dist

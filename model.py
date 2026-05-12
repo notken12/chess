@@ -109,7 +109,7 @@ def generateMoveLookup():
                                     channel = queenMove["SE"] * 7 + abs(distance[1]) -1
                                 else: #NW
                                     channel = queenMove["NW"] * 7 + abs(distance[1]) - 1
-                        else: #knight move
+                        elif distance in knightMove:
                             channel = knightMove[distance]
                         
                         # Store standard move
@@ -158,7 +158,7 @@ class Policy(nn.Module):
         logits = self.bn1(logits)
 
         batch_size = logits.size(0)
-        logits = logits.view(batch_size, -1)
+        logits = logits.reshape(batch_size, -1)
 
         if boards is None:
             return logits
@@ -195,23 +195,31 @@ class Value(nn.Module):
 
                 
 class Networks:
-    self.representation = representation
-    self.dynamics = dynamics
-    self.policy = policy
-    self.value = value
+    def __init__(self, representation, dynamics, policy, value):
+        self.representation = representation
+        self.dynamics = dynamics
+        self.policy = policy
+        self.value = value
 
-    def to(self, device)
+    def to(self, device):
         for m in (self.representation, self.dynamics, self.policy, self.value):
             m.to(device)
         return self
-    def eval(self)
+
+    def eval(self):
         for m in (self.representation, self.dynamics, self.policy, self.value):
             m.eval()
         return self
 
-  def build_networks(device="cuda"):
-      rep = Representation(obsChannels=119, convChannels=256)
-      dyn = Dynamics(actionChannels=73, stateChannels=256, convChannels=256)
-      pol = Policy(actionChannels=73, convChannels=256)
-      val = Value(convChannels=256, numBins=51)
-      return Networks(rep, dyn, pol, val).to(device)
+    def train(self):
+        for m in (self.representation, self.dynamics, self.policy, self.value):
+            m.train()
+        return self
+
+
+def build_networks(device="cuda"):
+    rep = Representation(obsChannels=119, convChannels=256)
+    dyn = Dynamics(actionChannels=73, stateChannels=256, convChannels=256)
+    pol = Policy(actionChannels=73, convChannels=256)
+    val = Value(convChannels=256, numBins=51)
+    return Networks(rep, dyn, pol, val).to(device)

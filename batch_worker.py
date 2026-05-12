@@ -6,21 +6,20 @@ from tensordict import TensorDict
 
 from replay_buffer import K_STEPS, L_STEPS, get_num_episodes, sample_batch
 from tree import get_target_policy, value_bins
-from model import Representation, Dynamics, Policy, Value
-
-
+from model import Networks
 
 # EfficientZero V2 mixed value target thresholds.
-# Before T1 training steps, the value network is too inaccurate to rely on
-# MCTS values, so the TD target is always used regardless of game recency.
 T1 = 10_000
-# The T2 most recently added games always use the TD target: their MCTS was
-# run with an older network snapshot and is therefore less trustworthy.
 T2 = 1_000
-# Chess terminal rewards arrive only at the end of the game, so no discounting
-# within the K-step window is necessary.
 GAMMA = 1.0
 BATCH_SIZE = 128
+
+_target_nets: Networks | None = None
+
+
+def set_target_networks(nets: Networks) -> None:
+    global _target_nets
+    _target_nets = nets
 
 
 class _ReanalysisResult(NamedTuple):
@@ -30,7 +29,10 @@ class _ReanalysisResult(NamedTuple):
 
 def _reanalyze(latent: torch.Tensor, policy_logits: torch.Tensor, nets: Networks) -> _ReanalysisResult:
     """Run MCTS for one latent state; return the improved policy and root value."""
-    _, target_policy, mcts_value = get_target_policy(latent, policy_logits, nets)
+    if latent.dim() == 3:
+        latent = latent.unsqueeze(0)
+    search_nets = _target_nets if _target_nets is not None else nets
+    _, target_policy, mcts_value = get_target_policy(latent, policy_logits, search_nets)
     return _ReanalysisResult(target_policy, mcts_value)
 
 

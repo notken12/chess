@@ -37,17 +37,19 @@ class TreeNode:
         self.action_space_size = action_space_size
         self.children: List[TreeNode | None] = [None] * action_space_size
         self.latent = latent
-        self.policy_logits = policy_logits
-        self.policy_probs = (
-            torch.softmax(policy_logits, dim=0) if policy_logits is not None else None
-        )
-        self.value_pred = value_pred
+        if policy_logits is not None:
+            policy_logits = policy_logits.squeeze()
+            self.policy_logits = policy_logits
+            self.policy_probs = torch.softmax(policy_logits, dim=0)
+        else:
+            self.policy_logits = None
+            self.policy_probs = None
+        self.value_pred = value_pred.squeeze() if value_pred is not None else None
         self.num_visits = num_visits
-        self.reward_pred = reward_pred
+        self.reward_pred = reward_pred.squeeze() if reward_pred is not None else None
         self.q_value_min_max = q_value_min_max
         self.average_value = 0
         self.most_visited_child_num_visits = 0
-        pass
 
     def policy_weighted_average_values(self):
         probs = [
@@ -173,61 +175,40 @@ def get_target_policy(cur_latent: torch.Tensor, cur_policy_logits: torch.Tensor,
 
 
 def simulate(prev_path: List[TreeNode], last_action: int, start_node: TreeNode, nets: "Networks"):
-    # models: {'representation': ..., 'dynamics': ..., 'policy': ..., 'value': ...}
     q_value_min_max = start_node.q_value_min_max
-    device = start_node.latent.device
+    device = next(nets.representation.parameters()).device
     v_bins = value_bins.to(device)
     r_bins = reward_bins.to(device)
     with torch.no_grad():
-        search_path = list(prev_path)  # node
+        search_path = list(prev_path)
         cur_node: TreeNode = start_node
         reached_leaf = False
-        last_action = last_action
         while not reached_leaf:
-            if cur_node.num_visits == 0:   
-                # this is a leaf
-                # TODO: simulate action via the dynamics function
-                # and get predicted value and reward
-                # 1. Get the parent and action that led here
+            if cur_node.num_visits == 0:
                 parent_node = search_path[-1]
-
-                # 2. Encode the scalar action into a (1, 73, 8, 8) tensor
-                # This matches your Dynamics input: (latent + action_channels)
                 action_one_hot = encode_single_action(last_action, device)
-
-                # 3. Model Inference (Expansion)
-                # next_latent: (1, 256, 8, 8), reward_logits: (1, 3)
                 next_latent, reward_logits = nets.dynamics(parent_node.latent, action_one_hot)
-
-                # 4. Leaf Predictions
-                # policy_logits: (1, 4672), value_logits: (1, 51)
                 policy_logits = nets.policy(next_latent, boards=None)
                 value_logits = nets.value(next_latent)
 
-                # 5. Populate the Leaf Node
                 cur_node.latent = next_latent
-                cur_node.policy_logits = policy_logits.squeeze(0) # Store as (4672,)
+                cur_node.policy_logits = policy_logits.squeeze(0)
+                cur_node.policy_probs = torch.softmax(cur_node.policy_logits, dim=0)
+                cur_node.value_pred = torch.softmax(value_logits, dim=-1).squeeze(0)
+                cur_node.reward_pred = torch.softmax(reward_logits, dim=-1).squeeze(0)
 
-                # Convert categorical logits to probability distributions for the backprop
-                cur_node.value_pred = torch.softmax(value_logits, dim=-1).squeeze(0) # (51,)
-                cur_node.reward_pred = torch.softmax(reward_logits, dim=-1).squeeze(0) # (3,)
-
-                # backpropagate to update average_value for this node and parents
                 search_path.append(cur_node)
-                q_value = torch.sum(cur_node.value_pred * value_bins).item()
+                q_value = torch.sum(cur_node.value_pred * v_bins).item()
                 for i in range(len(search_path) - 1, -1, -1):
                     node = search_path[i]
-                    immediate_reward=torch.sum(node.reward_pred * reward_bins).item()
-                    # crucially, we subtract the q value of the child node because it belongs to the opponent
-                    # and we want to minimize the opponent's reward (negamax)
+                    immediate_reward = torch.sum(node.reward_pred * r_bins).item()
                     new_average = (node.num_visits * node.average_value + q_value) / (
                         node.num_visits + 1
                     )
                     node.average_value = new_average
                     node.num_visits += 1
 
-                    q_value = immediate_reward - gamma*q_value
-                    
+                    q_value = immediate_reward - gamma * q_value
                     q_value_min_max.update(q_value)
 
                     if i > 0 and (
@@ -238,22 +219,25 @@ def simulate(prev_path: List[TreeNode], last_action: int, start_node: TreeNode, 
                             node.num_visits
                         )
 
-                # sample Gumbel top K here and add as child nodes
                 gumbel_noise = torch.from_numpy(_rng().gumbel(size=action_space_size)).to(device)
                 samples = gumbel_noise + cur_node.policy_logits
                 k = 10
                 top_k_idx = torch.topk(samples, k).indices.cpu().numpy()
                 for action_idx in top_k_idx:
-                    cur_node.children[action_idx]=TreeNode(action_space_size, None, None, None, None, q_value_min_max   )
+                    cur_node.children[action_idx] = TreeNode(
+                        action_space_size, None, None, None, None, q_value_min_max
+                    )
 
                 reached_leaf = True
                 break
 
             last_action = cur_node.pick_action()
             search_path.append(cur_node)
-            cur_node = cast(
-                TreeNode, cur_node.children[last_action]
-            )  # non-leaf nodes will always have children and only choose actions that are in their children list
+            child = cur_node.children[last_action]
+            if child is None:
+                child = TreeNode(action_space_size, None, None, None, None, q_value_min_max)
+                cur_node.children[last_action] = child
+            cur_node = cast(TreeNode, child)
 
 def encode_single_action(action_idx: int, device: torch.device):
     """
