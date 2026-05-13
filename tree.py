@@ -2,7 +2,7 @@ import threading
 from typing import List, TYPE_CHECKING
 import torch
 import numpy as np
-
+from model import Networks
 from hyperparams import NUM_SAMPLED_ACTIONS, NUM_SIMS_IN_SEARCH
 
 if TYPE_CHECKING:
