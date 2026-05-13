@@ -64,6 +64,15 @@ def main():
                 for _ in range(args.games_per_iter):
                     history, winner = self_play_worker.play_game()
                     logger.record_game(len(history), winner)
+                    n = get_num_episodes()
+                    result = (
+                        "draw" if winner is None else ("white" if winner else "black")
+                    )
+                    print(
+                        f"  game done: plies={len(history):>3d} result={result:<5s} "
+                        f"buffer={n}/{BATCH_SIZE}",
+                        flush=True,
+                    )
 
             # Train step once buffer is full enough.
             if get_num_episodes() >= BATCH_SIZE:
