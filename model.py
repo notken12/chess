@@ -224,6 +224,42 @@ class Value(nn.Module):
         return value_logits
 
 
+class ProjectionHead(nn.Module):
+    """P1: latent → embedding. Applied to both pred and real sides for consistency loss."""
+
+    def __init__(self, in_channels: int = 256, hidden: int = 1024, out: int = 1024):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(in_channels * 8 * 8, hidden),
+            nn.BatchNorm1d(hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, hidden),
+            nn.BatchNorm1d(hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, out),
+            nn.BatchNorm1d(out, affine=False),
+        )
+
+    def forward(self, latent):
+        return self.net(latent.flatten(1))
+
+
+class PredictionHead(nn.Module):
+    """P2: embedding → embedding. Applied to pred side only (SimSiam asymmetry)."""
+
+    def __init__(self, dim: int = 1024, hidden: int = 512):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden),
+            nn.BatchNorm1d(hidden),
+            nn.ReLU(),
+            nn.Linear(hidden, dim),
+        )
+
+    def forward(self, z):
+        return self.net(z)
+
+
 class Networks:
     def __init__(
         self,
@@ -231,24 +267,38 @@ class Networks:
         dynamics: nn.Module,
         policy: nn.Module,
         value: nn.Module,
+        projector: nn.Module,
+        predictor: nn.Module,
     ) -> None:
         self.representation = representation
         self.dynamics = dynamics
         self.policy = policy
         self.value = value
+        self.projector = projector
+        self.predictor = predictor
+
+    def _modules(self):
+        return (
+            self.representation,
+            self.dynamics,
+            self.policy,
+            self.value,
+            self.projector,
+            self.predictor,
+        )
 
     def to(self, device):
-        for m in (self.representation, self.dynamics, self.policy, self.value):
+        for m in self._modules():
             m.to(device)
         return self
 
     def eval(self):
-        for m in (self.representation, self.dynamics, self.policy, self.value):
+        for m in self._modules():
             m.eval()
         return self
 
     def train(self):
-        for m in (self.representation, self.dynamics, self.policy, self.value):
+        for m in self._modules():
             m.train()
         return self
 
@@ -258,4 +308,6 @@ def build_networks(device: torch.device):
     dyn = Dynamics(actionChannels=73, stateChannels=256, convChannels=256)
     pol = Policy(actionChannels=73, convChannels=256)
     val = Value(convChannels=256, numBins=51)
-    return Networks(rep, dyn, pol, val).to(device)
+    proj = ProjectionHead(in_channels=256)
+    pred = PredictionHead()
+    return Networks(rep, dyn, pol, val, proj, pred).to(device)
