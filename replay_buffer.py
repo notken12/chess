@@ -4,14 +4,16 @@ from collections import deque
 from tensordict import TensorDict
 import numpy as np
 
-# (observation (8,8,119), action index, reward)
+from hyperparams import REPLAY_CAPACITY, TD_STEPS, UNROLL_STEPS
+
+# (observation (8,8,119), action index, reward, move_mask)
 # Target policies are intentionally excluded: EfficientZero V2 uses reanalysis,
 # recomputing them from stored observations with the current network at training
 # time so the policy head always trains against up-to-date targets.
-Step = Tuple[torch.Tensor, int, int]
+Step = Tuple[torch.Tensor, int, int, torch.Tensor]
 
-K_STEPS = 5   # unroll depth: number of dynamics steps during training
-L_STEPS = 5   # TD horizon: number of real reward steps before bootstrapping
+K_STEPS = TD_STEPS  # unroll depth: number of dynamics steps during training
+L_STEPS = UNROLL_STEPS  # TD horizon: number of real reward steps before bootstrapping
 
 
 class EpisodeReplayBuffer:
@@ -25,8 +27,7 @@ class EpisodeReplayBuffer:
 
     Sampling is weighted by episode length so that every individual step has
     an equal probability of being selected as a window start, regardless of
-    game length. Windows that extend past the end of an episode are zero-padded
-    with a boolean mask marking which steps are real.
+    game length.
 
     Sample schema (batch_size B, unroll depth K, TD horizon L):
         observations          (B, K+L, 8, 8, 119) — K unroll steps + L extra steps.
@@ -42,7 +43,6 @@ class EpisodeReplayBuffer:
         rewards               (B, K+L)             — rewards for all K+L steps, needed to
                                                      compute l-step TD targets for each of
                                                      the K unroll positions.
-        mask                  (B, K+L)             — 1 for real steps, 0 for padding
         game_buffer_positions (B,)                 — deque index of each sampled game
                                                      (0 = oldest, N-1 = newest); used
                                                      by the batch worker to identify
@@ -52,7 +52,7 @@ class EpisodeReplayBuffer:
 
     def __init__(
         self,
-        max_episodes: int = 10_000,
+        max_episodes: int = REPLAY_CAPACITY,
         k_steps: int = K_STEPS,
         l_steps: int = L_STEPS,
     ) -> None:
@@ -63,12 +63,15 @@ class EpisodeReplayBuffer:
         self._total_steps = 0
 
     def add_episode(self, history: List[Step]) -> None:
-        observations, actions, rewards = zip(*history)
+        if len(history) < self.k_steps + self.l_steps:
+            return  # Too short for a full K+L window; skip entirely
+        observations, actions, rewards, move_masks = zip(*history)
         episode = TensorDict(
             {
                 "observation": torch.stack(observations),  # (T, 8, 8, 119)
-                "action": torch.tensor(actions),           # (T,)
+                "action": torch.tensor(actions),  # (T,)
                 "reward": torch.tensor(rewards, dtype=torch.float32),  # (T,)
+                "move_mask": torch.stack(move_masks),
             },
             batch_size=[len(history)],
         )
@@ -87,47 +90,50 @@ class EpisodeReplayBuffer:
         lengths = np.array([ep.batch_size[0] for ep in episodes], dtype=np.float64)
         probs = lengths / lengths.sum()
         # Sample indices (not the TensorDict objects) so we can track buffer positions.
-        episode_indices = np.random.choice(len(episodes), size=batch_size, p=probs, replace=True)
+        episode_indices = np.random.choice(
+            len(episodes), size=batch_size, p=probs, replace=True
+        )
 
         total_steps = self.k_steps + self.l_steps
-        obs_blank = None  # lazily set to a zero observation on first pad
-        observations, actions_out, rewards_out, masks, buffer_positions = [], [], [], [], []
+        observations, actions_out, rewards_out, masks_out, buffer_positions = (
+            [],
+            [],
+            [],
+            [],
+            [],
+        )
 
         for ep_idx in episode_indices:
             ep = episodes[ep_idx]
             buffer_positions.append(ep_idx)
             T = ep.batch_size[0]
-            t = np.random.randint(0, T)
+            # Reject windows that would exceed episode length.
+            max_t = max(0, T - total_steps)
+            t = np.random.randint(0, max_t + 1) if max_t > 0 else 0
 
-            if obs_blank is None:
-                obs_blank = torch.zeros_like(ep["observation"][0])
-
-            ep_obs, ep_actions, ep_rewards, ep_mask = [], [], [], []
+            ep_obs, ep_actions, ep_rewards, ep_masks = [], [], [], []
             for k in range(total_steps):
-                valid = t + k < T
-                ep_obs.append(ep["observation"][t + k] if valid else obs_blank)
-                ep_rewards.append(ep["reward"][t + k] if valid else torch.zeros(()))
-                ep_mask.append(1.0 if valid else 0.0)
+                ep_obs.append(ep["observation"][t + k])
+                ep_rewards.append(ep["reward"][t + k])
                 # Actions are only needed for the K unroll steps, not the extra L.
                 if k < self.k_steps:
-                    ep_actions.append(
-                        ep["action"][t + k] if valid else torch.zeros((), dtype=torch.long)
-                    )
+                    ep_actions.append(ep["action"][t + k])
+                    ep_masks.append(ep["move_mask"][t + k])
 
-            observations.append(torch.stack(ep_obs))       # (K+L, 8, 8, 119)
-            actions_out.append(torch.stack(ep_actions))    # (K,)
-            rewards_out.append(torch.stack(ep_rewards))    # (K+L,)
-            masks.append(torch.tensor(ep_mask))            # (K+L,)
+            observations.append(torch.stack(ep_obs))  # (K+L, 8, 8, 119)
+            actions_out.append(torch.stack(ep_actions))  # (K,)
+            rewards_out.append(torch.stack(ep_rewards))  # (K+L,)
+            masks_out.append(torch.stack(ep_masks))  # (K,)
 
         # target_policies are not included: the training loop recomputes them
         # via reanalysis (MCTS with the current network) on sampled observations.
         return TensorDict(
             {
-                "observations": torch.stack(observations),              # (B, K+L, 8, 8, 119)
-                "actions": torch.stack(actions_out),                    # (B, K)
-                "rewards": torch.stack(rewards_out),                    # (B, K+L)
-                "mask": torch.stack(masks),                             # (B, K+L)
-                "game_buffer_positions": torch.tensor(buffer_positions),# (B,)
+                "observations": torch.stack(observations),  # (B, K+L, 8, 8, 119)
+                "actions": torch.stack(actions_out),  # (B, K)
+                "rewards": torch.stack(rewards_out),  # (B, K+L)
+                "game_buffer_positions": torch.tensor(buffer_positions),  # (B,)
+                "move_masks": torch.stack(masks_out),  # (B, K, 4672)
             },
             batch_size=[batch_size],
         )

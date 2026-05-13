@@ -1,12 +1,41 @@
 from collections import deque
 from typing import List
+import copy
 
 import chess
 
-from model import Networks
+from model import Networks, create_mask
 from observation import NUM_SNAPSHOTS, board_to_observation
 from tree import get_target_policy
 from replay_buffer import Step, save_to_replay_buffer
+from hyperparams import SELF_PLAY_NET_UPDATE_INTERVAL
+
+
+class SelfPlayWorker:
+    """Owns a network snapshot for self-play, refreshed from the learner periodically."""
+
+    def __init__(self, nets: Networks) -> None:
+        self.nets = copy.deepcopy(nets)
+        self.nets.eval()
+        for module in (self.nets.representation, self.nets.dynamics, self.nets.policy, self.nets.value):
+            for p in module.parameters():
+                p.requires_grad = False
+        self._last_update_step = -1
+
+    def maybe_update(self, latest_nets: Networks, training_step: int) -> bool:
+        """Refresh the local snapshot if the update interval has passed."""
+        if training_step - self._last_update_step >= SELF_PLAY_NET_UPDATE_INTERVAL:
+            self.nets = copy.deepcopy(latest_nets)
+            self.nets.eval()
+            for module in (self.nets.representation, self.nets.dynamics, self.nets.policy, self.nets.value):
+                for p in module.parameters():
+                    p.requires_grad = False
+            self._last_update_step = training_step
+            return True
+        return False
+
+    def play_game(self) -> List[Step]:
+        return _play_game(self.nets)
 
 
 def action_to_chess_move(
@@ -65,7 +94,7 @@ def action_to_chess_move(
     return move
 
 
-def play_game(nets: Networks) -> List[Step]:
+def _play_game(nets: Networks) -> List[Step]:
     history: List[Step] = []
     board = chess.Board()
     # Rolling window of board snapshots always encoded from white's perspective,
@@ -86,13 +115,14 @@ def play_game(nets: Networks) -> List[Step]:
             obs_board = real_board
             obs_history = list(board_history)
 
-        observation = board_to_observation(obs_board, history=list(obs_history))
-        latent = nets.representation(observation.permute(2, 0, 1).unsqueeze(0)).squeeze(
-            0
+        device = next(nets.representation.parameters()).device
+        observation = board_to_observation(obs_board, history=list(obs_history)).to(device)
+        latent = nets.representation(observation.permute(2, 0, 1).unsqueeze(0))
+        policy_logits = nets.policy(
+            latent, create_mask(obs_board).view(-1).unsqueeze(0)
         )
-        policy_logits = nets.policy(latent, boards=None).squeeze(0)
         target_action, _target_policy, _target_value = get_target_policy(
-            latent, policy_logits, nets
+            latent, policy_logits.squeeze(0), nets
         )
         board.push(
             action_to_chess_move(target_action, board, board.turn == chess.BLACK)
@@ -102,6 +132,8 @@ def play_game(nets: Networks) -> List[Step]:
         # if our last move made us win, we give a reward of 1
         # there is no way to lose from making a move.
         reward = 1 if outcome and outcome.winner is not None else 0
-        history.append((observation, target_action, reward))
+        history.append(
+            (observation, target_action, reward, create_mask(board).view(-1))
+        )
     save_to_replay_buffer(history)
     return history

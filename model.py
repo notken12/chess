@@ -165,6 +165,18 @@ def generateMoveLookup():
 MOVE_LOOKUP = generateMoveLookup()
 
 
+def create_mask(board):
+    mask = torch.full((73, 8, 8), -1e9)
+    for move in board.legal_moves:
+        uci = move.uci()
+        if uci in MOVE_LOOKUP:
+            z, x, y = MOVE_LOOKUP[uci]
+            mask[z, x, y] = 0.0
+        else:
+            print(f"Warning: Move {uci} not found in lookup table.")
+    return mask
+
+
 class Policy(nn.Module):
     def __init__(self, actionChannels, convChannels):
         super().__init__()
@@ -172,32 +184,17 @@ class Policy(nn.Module):
         self.conv1 = nn.Conv2d(convChannels, actionChannels, kernel_size=1)
         self.bn1 = nn.BatchNorm2d(actionChannels)
 
-    @staticmethod
-    # Iterate through legal moves
-    def createMask(board):
-        mask = torch.full((73, 8, 8), -1e9)
-        for move in board.legal_moves:
-            uci = move.uci()
-            if uci in MOVE_LOOKUP:
-                z, x, y = MOVE_LOOKUP[uci]
-                mask[z, x, y] = 0.0
-            else:
-                print(f"Warning: Move {uci} not found in lookup table.")
-        return mask
-
-    def forward(self, x, boards):
+    def forward(self, x, masks):
         logits = self.conv1(x)
         logits = self.bn1(logits)
 
         batch_size = logits.size(0)
         logits = logits.reshape(batch_size, -1)
 
-        if boards is None:
+        if masks is None:
             return logits
 
-        masks = [self.createMask(b).view(-1) for b in boards]
-        mask_stack = torch.stack(masks).to(logits.device)
-        return logits + mask_stack
+        return logits + masks
 
 
 class Value(nn.Module):
@@ -256,10 +253,9 @@ class Networks:
         return self
 
 
-def build_networks(device="cuda"):
+def build_networks(device: torch.device):
     rep = Representation(obsChannels=119, convChannels=256)
     dyn = Dynamics(actionChannels=73, stateChannels=256, convChannels=256)
     pol = Policy(actionChannels=73, convChannels=256)
     val = Value(convChannels=256, numBins=51)
     return Networks(rep, dyn, pol, val).to(device)
-

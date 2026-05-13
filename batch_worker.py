@@ -3,21 +3,10 @@ from typing import NamedTuple
 
 import torch
 
+from hyperparams import BATCH_SIZE, GAMMA, T1, T2
 from model import Networks
 from replay_buffer import K_STEPS, L_STEPS, get_num_episodes, sample_batch
 from tree import get_target_policy, value_bins
-
-# EfficientZero V2 mixed value target thresholds.
-# Before T1 training steps, the value network is too inaccurate to rely on
-# MCTS values, so the TD target is always used regardless of game recency.
-T1 = 10_000
-# The T2 most recently added games always use the TD target: their MCTS was
-# run with an older network snapshot and is therefore less trustworthy.
-T2 = 1_000
-# Chess terminal rewards arrive only at the end of the game, so no discounting
-# within the K-step window is necessary.
-GAMMA = 1.0
-BATCH_SIZE = 128
 
 
 class _ReanalysisResult(NamedTuple):
@@ -28,8 +17,10 @@ class _ReanalysisResult(NamedTuple):
 def _reanalyze(
     latent: torch.Tensor, policy_logits: torch.Tensor, target_nets: Networks
 ) -> _ReanalysisResult:
-    """Run MCTS for one latent state; return the improved policy and root value."""
-    _, target_policy, mcts_value = get_target_policy(latent, policy_logits, target_nets)
+    """Run MCTS for one latent state (without batch dimension); return the improved policy and root value."""
+    _, target_policy, mcts_value = get_target_policy(
+        latent.unsqueeze(0), policy_logits, target_nets
+    )
     return _ReanalysisResult(target_policy, mcts_value)
 
 
@@ -72,21 +63,23 @@ def provide_batch_transitions(
     num_games = get_num_episodes()
     if num_games < BATCH_SIZE:
         return None
-    batch = sample_batch(batch_size=BATCH_SIZE)
+    device = next(nets.representation.parameters()).device
+    batch = sample_batch(batch_size=BATCH_SIZE).to(device)
     observations = batch["observations"]  # (B, K+L, 8, 8, 119)
     # observations shape: (B, K+L, 8, 8, 119)
     obs_chw = observations.permute(0, 1, 4, 2, 3)
     # new shape: (B, K+L, 119, 8, 8)
     rewards = batch["rewards"]  # (B, K+L)
-    mask = batch["mask"]  # (B, K+L)
     B = observations.shape[0]
 
     # --- Reanalysis: MCTS on the K unroll steps only ---
-    unroll_obs = obs_chw[:, :K_STEPS]  # (B*K, 119, 8, 8)
+    unroll_obs = obs_chw[:, :K_STEPS]  # (B, K, 119, 8, 8)
     unroll_obs_flat = unroll_obs.flatten(0, 1)
+    unroll_masks = batch["move_masks"]
+    unroll_masks_flat = unroll_masks.flatten(0, 1)
     with torch.no_grad():
         latents_flat = nets.representation(unroll_obs_flat)  # (B*K, 256, 8, 8)
-        logits_flat = nets.policy(latents_flat, boards=None)  # (B*K, A)
+        logits_flat = nets.policy(latents_flat, unroll_masks_flat)  # (B*K, A)
 
     # Parallel MCTS for all B*K unroll positions.
     # tree.py uses thread-local RNGs so workers don't corrupt each other's state.
@@ -117,22 +110,21 @@ def provide_batch_transitions(
     bins = value_bins.to(boot_value_probs.device)
     boot_values_flat = (boot_value_probs * bins).sum(dim=-1)  # (B*K,) expected value
     bootstrap_values = boot_values_flat.view(B, K_STEPS)  # (B, K)
-    # Zero out positions where the game had already ended.
-    bootstrap_values = bootstrap_values * mask[:, L_STEPS : K_STEPS + L_STEPS]
 
-    td_targets = _build_td_targets(
-        rewards[:, : K_STEPS + L_STEPS], bootstrap_values
-    )  # (B, K)
+    td_targets = _build_td_targets(rewards, bootstrap_values)  # (B, K)
 
     # --- Mixed value target (EfficientZero V2) ---
     #   condition 1 — early training: value net not yet reliable, always use TD
     #   condition 2 — recent games: their MCTS ran on a stale network, use TD
     # Both evaluated without any Python-level branching over B*K.
     game_positions = batch["game_buffer_positions"]  # (B,)
-    cond_recent = game_positions >= (num_games - T2)  # (B,)
-    use_td = torch.as_tensor(training_step < T1) | cond_recent.unsqueeze(1)  # (B, K)
-
-    target_values = torch.where(use_td, td_targets, mcts_values)  # (B, K)
+    if training_step < T1:
+        target_values = td_targets
+    else:
+        cond_recent = game_positions >= (num_games - T2)  # (B,)
+        target_values = torch.where(
+            cond_recent.unsqueeze(1), td_targets, mcts_values
+        )  # (B, K)
 
     batch["observations"] = obs_chw
     batch["target_policies"] = target_policies  # (B, K, A)

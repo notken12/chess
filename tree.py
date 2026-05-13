@@ -3,6 +3,8 @@ from typing import List, TYPE_CHECKING
 import torch
 import numpy as np
 
+from hyperparams import NUM_SAMPLED_ACTIONS, NUM_SIMS_IN_SEARCH
+
 if TYPE_CHECKING:
     from model import Networks
 
@@ -108,6 +110,7 @@ gamma = 1
 def get_target_policy(
     cur_latent: torch.Tensor, cur_policy_logits: torch.Tensor, nets: Networks
 ):
+    """call with tensors without batch dimension"""
     qmm = MinMaxStats()
     device = cur_latent.device
 
@@ -128,14 +131,14 @@ def get_target_policy(
     # Gumbel top-k at the root
     gumbel = torch.from_numpy(_rng().gumbel(size=action_space_size)).to(device)
     samples = gumbel + cur_policy_logits
-    k = 16
+    k = NUM_SAMPLED_ACTIONS
     top_k_idx = np.argpartition(samples.detach().cpu().numpy(), -k)[-k:]
     root.sampled_actions = set(int(a) for a in top_k_idx)
 
     # Sequential halving over root actions
     roots = [int(a) for a in top_k_idx]
     remain = k
-    simulation_budget_per_node = 100
+    simulation_budget_per_node = NUM_SIMS_IN_SEARCH // NUM_SAMPLED_ACTIONS
 
     while remain > 1:
         for action_idx in roots:
@@ -165,7 +168,7 @@ def get_target_policy(
     return root_action, target_policy, root.average_value
 
 
-def _simulate(path: List[TreeNode], action: int, nets: "Networks"):
+def _simulate(path: List[TreeNode], action: int, nets: Networks):
     """Traverse from the last node in *path* via *action*, expanding if needed."""
     parent = path[-1]
     if action not in parent.children:
@@ -180,7 +183,7 @@ def _simulate(path: List[TreeNode], action: int, nets: "Networks"):
     _simulate(path, next_action, nets)
 
 
-def _expand(path: List[TreeNode], action: int, nets: "Networks"):
+def _expand(path: List[TreeNode], action: int, nets: Networks):
     """Expand *action* from path[-1], backpropagate, and sample children."""
     parent = path[-1]
     device = parent.latent.device
@@ -190,7 +193,7 @@ def _expand(path: List[TreeNode], action: int, nets: "Networks"):
     with torch.no_grad():
         action_one_hot = encode_single_action(action, device)
         next_latent, reward_logits = nets.dynamics(parent.latent, action_one_hot)
-        policy_logits = nets.policy(next_latent, boards=None).squeeze(0)
+        policy_logits = nets.policy(next_latent, masks=None).squeeze(0)
         value_logits = nets.value(next_latent)
 
         value_pred = torch.softmax(value_logits, dim=-1).squeeze(0)
