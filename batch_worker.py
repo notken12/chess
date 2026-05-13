@@ -3,9 +3,9 @@ from typing import NamedTuple
 
 import torch
 
-from hyperparams import BATCH_SIZE, GAMMA, T1, T2
+from hyperparams import BATCH_SIZE, GAMMA, T1, T2, TD_STEPS, UNROLL_STEPS
 from model import Networks
-from replay_buffer import K_STEPS, L_STEPS, get_num_episodes, sample_batch
+from replay_buffer import get_num_episodes, sample_batch
 from tree import get_target_policy, value_bins
 
 
@@ -65,6 +65,9 @@ def provide_batch_transitions(
         return None
     device = next(nets.representation.parameters()).device
     batch = sample_batch(batch_size=BATCH_SIZE).to(device)
+    step_idx = torch.arange(UNROLL_STEPS, device=device).unsqueeze(0)
+    valid = step_idx < batch["window_lengths"].unsqueeze(1)
+
     observations = batch["observations"]  # (B, K+L, 8, 8, 119)
     # observations shape: (B, K+L, 8, 8, 119)
     obs_chw = observations.permute(0, 1, 4, 2, 3)
@@ -72,17 +75,23 @@ def provide_batch_transitions(
     rewards = batch["rewards"]  # (B, K+L)
     B = observations.shape[0]
 
-    # --- Reanalysis: MCTS on the K unroll steps only ---
-    unroll_obs = obs_chw[:, :K_STEPS]  # (B, K, 119, 8, 8)
-    unroll_obs_flat = unroll_obs.flatten(0, 1)
+    # --- Reanalysis: MCTS on valid unroll steps only ---
+    unroll_obs = obs_chw[:, :UNROLL_STEPS]  # (B, K, 119, 8, 8)
     unroll_masks = batch["move_masks"]
-    unroll_masks_flat = unroll_masks.flatten(0, 1)
-    with torch.no_grad():
-        latents_flat = nets.representation(unroll_obs_flat)  # (B*K, 256, 8, 8)
-        logits_flat = nets.policy(latents_flat, unroll_masks_flat)  # (B*K, A)
 
-    # Parallel MCTS for all B*K unroll positions.
-    # tree.py uses thread-local RNGs so workers don't corrupt each other's state.
+    valid_flat = valid.flatten()
+    unroll_obs_flat = unroll_obs.flatten(0, 1)[valid_flat]  # (N_valid, 119, 8, 8)
+    unroll_masks_flat = unroll_masks.flatten(0, 1)[valid_flat]  # (N_valid, 4672)
+
+    with torch.no_grad():
+        latents_flat = target_nets.representation(
+            unroll_obs_flat
+        )  # (N_valid, 256, 8, 8)
+        logits_flat = target_nets.policy(
+            latents_flat, unroll_masks_flat
+        )  # (N_valid, A)
+
+    # Run MCTS on valid unroll positions
     with ThreadPoolExecutor() as executor:
         results = list(
             executor.map(
@@ -90,28 +99,28 @@ def provide_batch_transitions(
                 zip(latents_flat, logits_flat),
             )
         )
-    target_policies = torch.stack([r.target_policy for r in results]).view(
-        B, K_STEPS, -1
-    )
-    mcts_values = torch.tensor(
-        [r.mcts_value for r in results], device=observations.device
-    ).view(B, K_STEPS)
 
-    # --- Bootstrap values: V(s_{t+j+L}) for each unroll position j ---
-    # The bootstrap for position j sits at window index j+L, spanning L..K+L-1.
-    boot_obs = obs_chw[:, L_STEPS : K_STEPS + L_STEPS]  # (B, K, 8, 8, 119)
-    boot_obs_flat = boot_obs.flatten(0, 1)  # (B*K, 8, 8, 119)
+    # Reconstruct (B, K) tensors, zero/one-hot fill for padded positions
+    A = logits_flat.shape[-1]
+    target_policies = torch.zeros(B, UNROLL_STEPS, A, device=device)
+    mcts_values = torch.zeros(B, UNROLL_STEPS, device=device)
+    target_policies[valid] = torch.stack([r.target_policy for r in results])
+    mcts_values[valid] = torch.tensor([r.mcts_value for r in results], device=device)
+
+    # --- Bootstrap values: only on valid positions ---
+    boot_valid = (step_idx + TD_STEPS) < batch["window_lengths"].unsqueeze(1)  # (B, K)
+    boot_obs = obs_chw[:, TD_STEPS : UNROLL_STEPS + TD_STEPS]  # (B, K, 119, 8, 8)
+    boot_obs_flat = boot_obs.flatten(0, 1)[boot_valid.flatten()]  # (N_boot, 119, 8, 8)
     with torch.no_grad():
-        boot_latents = nets.representation(boot_obs_flat)  # (B*K, 256, 8, 8)
-        boot_value_logits = nets.value(boot_latents)  # (B*K, num_bins)
-        # Convert bins back to a single scalar value
+        boot_latents = target_nets.representation(boot_obs_flat)
+        boot_value_logits = target_nets.value(boot_latents)
         boot_value_probs = torch.softmax(boot_value_logits, dim=-1)
+    boot_values_flat = (boot_value_probs * value_bins.to(device)).sum(dim=-1)
+    bootstrap_values = torch.zeros(B, UNROLL_STEPS, device=device)
+    bootstrap_values[boot_valid] = boot_values_flat
 
-    bins = value_bins.to(boot_value_probs.device)
-    boot_values_flat = (boot_value_probs * bins).sum(dim=-1)  # (B*K,) expected value
-    bootstrap_values = boot_values_flat.view(B, K_STEPS)  # (B, K)
-
-    td_targets = _build_td_targets(rewards, bootstrap_values)  # (B, K)
+    # TD targets: padded rewards are already 0, and invalid bootstraps are 0
+    td_targets = _build_td_targets(rewards, bootstrap_values)
 
     # --- Mixed value target (EfficientZero V2) ---
     #   condition 1 — early training: value net not yet reliable, always use TD

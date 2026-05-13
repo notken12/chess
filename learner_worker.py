@@ -10,11 +10,11 @@ from hyperparams import (
     POLICY_LOSS_COEFF,
     REWARD_LOSS_COEFF,
     TARGET_NET_UPDATE_INTERVAL,
+    UNROLL_STEPS,
     VALUE_LOSS_COEFF,
 )
 from model import Networks
 from batch_worker import provide_batch_transitions
-from replay_buffer import K_STEPS
 from tree import value_bins  # For move encoding and categorical support
 
 
@@ -52,9 +52,6 @@ class Learner:
         self.value_bins = value_bins  # torch.linspace(-1, 1, num_bins)
 
     def update_step(self, batch, training_step):
-        batch = provide_batch_transitions(training_step, self.nets, self.target_nets)
-        if batch is None:
-            return
         batch = batch.to(self.device)
 
         obs_0 = batch["observations"][:, 0]
@@ -63,8 +60,13 @@ class Learner:
         total_loss = torch.tensor(0.0, device=self.device)
 
         move_masks = batch["move_masks"]  # (B,K,4672)
+
+        window_lengths = batch["window_lengths"]  # (B,)
+        step_idx = torch.arange(UNROLL_STEPS, device=self.device).unsqueeze(0)  # (1,K)
+        valid = step_idx < window_lengths.unsqueeze(1)  # (B,K)
+
         # Unroll Loop for BPTT
-        for k in range(K_STEPS):
+        for k in range(UNROLL_STEPS):
             # --- Predictions ---
             pred_value_logits = self.value(latent)
             pred_policy_logits = self.policy(latent, move_masks[:, k])
@@ -74,34 +76,43 @@ class Learner:
 
             p_loss = self.compute_policy_loss(pred_policy_logits, target_policy)
             v_loss = self.compute_value_loss(pred_value_logits, target_value)
-            total_loss += POLICY_LOSS_COEFF * p_loss + VALUE_LOSS_COEFF * v_loss
+            mask_k = valid[:, k]
+            num_valid_k = mask_k.sum()
+            if num_valid_k == 0:
+                continue
+            total_loss += POLICY_LOSS_COEFF * (p_loss * mask_k).sum() / num_valid_k
+            total_loss += VALUE_LOSS_COEFF * (v_loss * mask_k).sum() / num_valid_k
 
             # --- Transitions ---
-            if k < K_STEPS - 1:
-                action_indices = batch["actions"][:, k]
-                action_tensor = self.encode_action(action_indices)
-
-                # Dynamics returns (nextState, rewardProbs)
-                latent, pred_reward_logits = self.dynamics(latent, action_tensor)
-
-                # Reward Loss
-                target_reward = batch["rewards"][:, k]
-                r_loss = self.compute_reward_loss(pred_reward_logits, target_reward)
-
-                # Consistency Loss (Grounding the dream)
+            if k < UNROLL_STEPS - 1:
+                action_tensor = self.encode_action(batch["actions"][:, k])
+                next_latent, pred_reward_logits = self.dynamics(latent, action_tensor)
+                # Reward loss at step k: valid if step k itself is real
+                r_loss = self.compute_reward_loss(
+                    pred_reward_logits, batch["rewards"][:, k]
+                )
+                # Consistency loss: needs step k+1 to also be real
                 real_obs_k = batch["observations"][:, k + 1]
                 with torch.no_grad():
                     real_latent = self.target_nets.representation(real_obs_k)
-
-                c_loss = self.compute_consistency_loss(latent, real_latent)
+                c_loss = self.compute_consistency_loss(next_latent, real_latent)
+                # Entropy regularization on policy at step k
+                e_loss = self.compute_entropy_loss(pred_policy_logits)
+                # Reward and entropy: supervise if step k is real
+                total_loss += REWARD_LOSS_COEFF * (r_loss * mask_k).sum() / num_valid_k
                 total_loss += (
-                    REWARD_LOSS_COEFF * r_loss + CONSISTENCY_LOSS_COEFF * c_loss
+                    POLICY_ENTROPY_LOSS_COEFF * (e_loss * mask_k).sum() / num_valid_k
                 )
-
-                policy_entropy_loss = self.compute_entropy_loss(pred_policy_logits)
-                total_loss += POLICY_ENTROPY_LOSS_COEFF * policy_entropy_loss
-
-                # Gradient Scaling: Scale by 1/2 at each step of the chain
+                # Consistency: only if next state is also real
+                cons_mask = valid[:, k] & valid[:, k + 1]
+                if cons_mask.any():
+                    total_loss += (
+                        CONSISTENCY_LOSS_COEFF
+                        * (c_loss * cons_mask).sum()
+                        / cons_mask.sum()
+                    )
+                # Gradient scaling for BPTT
+                latent = next_latent
                 latent.register_hook(lambda grad: grad * 0.5)
 
         # Optimization Step
@@ -113,27 +124,30 @@ class Learner:
             self.update_target_networks()
 
     # --- Loss Helper Functions ---
+    # these all return all per-sample losses (B,)
 
     def compute_policy_loss(self, pred_logits, target_policy):
-        return -(target_policy * F.log_softmax(pred_logits, dim=1)).sum(dim=1).mean()
+        return -(target_policy * F.log_softmax(pred_logits, dim=1)).sum(dim=1)  # (B,)
 
     def compute_value_loss(self, pred_logits, target_value):
         target_dist = self.scalar_to_categorical(target_value)
-        return -(target_dist * F.log_softmax(pred_logits, dim=1)).sum(dim=1).mean()
+        return -(target_dist * F.log_softmax(pred_logits, dim=1)).sum(dim=1)  # (B,)
 
     def compute_reward_loss(self, pred_logits, target_reward):
         # Maps -1, 0, 1 to class indices 0, 1, 2
-        return F.cross_entropy(pred_logits, (target_reward + 1).long())
+        return F.cross_entropy(
+            pred_logits, (target_reward + 1).long(), reduction="none"
+        )  # (B,)
 
     def compute_consistency_loss(self, pred_latent, real_latent):
         p = F.normalize(pred_latent.flatten(1), p=2, dim=1)
         r = F.normalize(real_latent.flatten(1), p=2, dim=1)
-        return F.mse_loss(p, r)
+        return F.mse_loss(p, r, reduction="none").mean(dim=1)  # (B,)
 
     def compute_entropy_loss(self, pred_logits):
         probs = F.softmax(pred_logits, dim=1)
         log_probs = F.log_softmax(pred_logits, dim=1)
-        return (probs * log_probs).sum(dim=1).mean()
+        return -(probs * log_probs).sum(dim=1)  # (B,)
 
     def update_target_networks(self):
         self.target_nets = copy.deepcopy(self.nets)

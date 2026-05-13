@@ -9,6 +9,7 @@ from observation import NUM_SNAPSHOTS, board_to_observation
 from tree import get_target_policy
 from replay_buffer import Step, save_to_replay_buffer
 from hyperparams import SELF_PLAY_NET_UPDATE_INTERVAL
+import torch
 
 
 class SelfPlayWorker:
@@ -17,7 +18,12 @@ class SelfPlayWorker:
     def __init__(self, nets: Networks) -> None:
         self.nets = copy.deepcopy(nets)
         self.nets.eval()
-        for module in (self.nets.representation, self.nets.dynamics, self.nets.policy, self.nets.value):
+        for module in (
+            self.nets.representation,
+            self.nets.dynamics,
+            self.nets.policy,
+            self.nets.value,
+        ):
             for p in module.parameters():
                 p.requires_grad = False
         self._last_update_step = -1
@@ -27,7 +33,12 @@ class SelfPlayWorker:
         if training_step - self._last_update_step >= SELF_PLAY_NET_UPDATE_INTERVAL:
             self.nets = copy.deepcopy(latest_nets)
             self.nets.eval()
-            for module in (self.nets.representation, self.nets.dynamics, self.nets.policy, self.nets.value):
+            for module in (
+                self.nets.representation,
+                self.nets.dynamics,
+                self.nets.policy,
+                self.nets.value,
+            ):
                 for p in module.parameters():
                     p.requires_grad = False
             self._last_update_step = training_step
@@ -104,26 +115,28 @@ def _play_game(nets: Networks) -> List[Step]:
     board_history: deque[chess.Board] = deque(maxlen=NUM_SNAPSHOTS)
     while not board.is_game_over():
         # Always encode from white's perspective: mirror the board when it's
-        # black's turn. Use copy(stack=False) for white to avoid storing a
-        # live reference that mutates after board.push().
-        real_board = board.copy(stack=False)
+        # black's turn.
+        real_board = copy.deepcopy(board)
         board_history.appendleft(real_board)
         if board.turn == chess.BLACK:
-            obs_board = board.mirror()
-            obs_history = [b.mirror() for b in board_history]
+            obs_board = copy.deepcopy(board).mirror()
+            obs_history = [copy.deepcopy(b).mirror() for b in board_history]
         else:
             obs_board = real_board
             obs_history = list(board_history)
 
         device = next(nets.representation.parameters()).device
-        observation = board_to_observation(obs_board, history=list(obs_history)).to(device)
+        observation = board_to_observation(obs_board, history=list(obs_history)).to(
+            device
+        )
         latent = nets.representation(observation.permute(2, 0, 1).unsqueeze(0))
         policy_logits = nets.policy(
-            latent, create_mask(obs_board).view(-1).unsqueeze(0)
+            latent, create_mask(obs_board, device=device).view(-1).unsqueeze(0)
         )
         target_action, _target_policy, _target_value = get_target_policy(
             latent, policy_logits.squeeze(0), nets
         )
+        mask = create_mask(obs_board, device=torch.device("cpu")).view(-1)
         board.push(
             action_to_chess_move(target_action, board, board.turn == chess.BLACK)
         )
@@ -132,8 +145,6 @@ def _play_game(nets: Networks) -> List[Step]:
         # if our last move made us win, we give a reward of 1
         # there is no way to lose from making a move.
         reward = 1 if outcome and outcome.winner is not None else 0
-        history.append(
-            (observation, target_action, reward, create_mask(board).view(-1))
-        )
+        history.append((observation, target_action, reward, mask))
     save_to_replay_buffer(history)
     return history

@@ -12,9 +12,6 @@ from hyperparams import REPLAY_CAPACITY, TD_STEPS, UNROLL_STEPS
 # time so the policy head always trains against up-to-date targets.
 Step = Tuple[torch.Tensor, int, int, torch.Tensor]
 
-K_STEPS = TD_STEPS  # unroll depth: number of dynamics steps during training
-L_STEPS = UNROLL_STEPS  # TD horizon: number of real reward steps before bootstrapping
-
 
 class EpisodeReplayBuffer:
     """
@@ -53,18 +50,12 @@ class EpisodeReplayBuffer:
     def __init__(
         self,
         max_episodes: int = REPLAY_CAPACITY,
-        k_steps: int = K_STEPS,
-        l_steps: int = L_STEPS,
     ) -> None:
         self.max_episodes = max_episodes
-        self.k_steps = k_steps
-        self.l_steps = l_steps
         self._episodes: deque[TensorDict] = deque()
         self._total_steps = 0
 
     def add_episode(self, history: List[Step]) -> None:
-        if len(history) < self.k_steps + self.l_steps:
-            return  # Too short for a full K+L window; skip entirely
         observations, actions, rewards, move_masks = zip(*history)
         episode = TensorDict(
             {
@@ -94,35 +85,43 @@ class EpisodeReplayBuffer:
             len(episodes), size=batch_size, p=probs, replace=True
         )
 
-        total_steps = self.k_steps + self.l_steps
-        observations, actions_out, rewards_out, masks_out, buffer_positions = (
-            [],
-            [],
-            [],
-            [],
-            [],
-        )
+        total_steps = UNROLL_STEPS + TD_STEPS
+        (
+            observations,
+            actions_out,
+            rewards_out,
+            masks_out,
+            buffer_positions,
+            window_lengths,
+        ) = ([], [], [], [], [], [])
 
         for ep_idx in episode_indices:
             ep = episodes[ep_idx]
             buffer_positions.append(ep_idx)
             T = ep.batch_size[0]
-            # Reject windows that would exceed episode length.
-            max_t = max(0, T - total_steps)
-            t = np.random.randint(0, max_t + 1) if max_t > 0 else 0
+            t = np.random.randint(0, T)
+            window_lengths.append(min(T - t, total_steps))
 
             ep_obs, ep_actions, ep_rewards, ep_masks = [], [], [], []
             for k in range(total_steps):
+                if t + k >= T:
+                    ep_obs.append(torch.zeros_like(ep_obs[0]))
+                    ep_rewards.append(torch.tensor(0.0, dtype=torch.float32))
+                    if k < UNROLL_STEPS:
+                        ep_actions.append(torch.tensor(0, dtype=torch.long))
+                        ep_masks.append(torch.full_like(ep_masks[0], -1e9))
+                    continue
+
                 ep_obs.append(ep["observation"][t + k])
                 ep_rewards.append(ep["reward"][t + k])
                 # Actions are only needed for the K unroll steps, not the extra L.
-                if k < self.k_steps:
+                if k < UNROLL_STEPS:
                     ep_actions.append(ep["action"][t + k])
                     ep_masks.append(ep["move_mask"][t + k])
 
             observations.append(torch.stack(ep_obs))  # (K+L, 8, 8, 119)
-            actions_out.append(torch.stack(ep_actions))  # (K,)
             rewards_out.append(torch.stack(ep_rewards))  # (K+L,)
+            actions_out.append(torch.stack(ep_actions))  # (K,)
             masks_out.append(torch.stack(ep_masks))  # (K,)
 
         # target_policies are not included: the training loop recomputes them
@@ -132,8 +131,9 @@ class EpisodeReplayBuffer:
                 "observations": torch.stack(observations),  # (B, K+L, 8, 8, 119)
                 "actions": torch.stack(actions_out),  # (B, K)
                 "rewards": torch.stack(rewards_out),  # (B, K+L)
-                "game_buffer_positions": torch.tensor(buffer_positions),  # (B,)
                 "move_masks": torch.stack(masks_out),  # (B, K, 4672)
+                "game_buffer_positions": torch.tensor(buffer_positions),  # (B,)
+                "window_lengths": torch.tensor(window_lengths),  # (B,)
             },
             batch_size=[batch_size],
         )
@@ -142,7 +142,7 @@ class EpisodeReplayBuffer:
         return self._total_steps
 
 
-rb = EpisodeReplayBuffer(max_episodes=10_000, k_steps=K_STEPS, l_steps=L_STEPS)
+rb = EpisodeReplayBuffer(max_episodes=10_000)
 
 
 def save_to_replay_buffer(history: List[Step]) -> None:

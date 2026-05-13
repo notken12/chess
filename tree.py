@@ -128,17 +128,29 @@ def get_target_policy(
         q_value_min_max=qmm,
     )
 
-    # Gumbel top-k at the root
-    gumbel = torch.from_numpy(_rng().gumbel(size=action_space_size)).to(device)
+    # Gumbel top-k at the root (only sample legal actions)
+    gumbel = torch.from_numpy(
+        _rng().gumbel(size=action_space_size).astype(np.float32)
+    ).to(device)
     samples = gumbel + cur_policy_logits
-    k = NUM_SAMPLED_ACTIONS
-    top_k_idx = np.argpartition(samples.detach().cpu().numpy(), -k)[-k:]
-    root.sampled_actions = set(int(a) for a in top_k_idx)
+
+    legal_mask = cur_policy_logits > -1e8  # illegal moves masked to -1e9
+    legal_actions = torch.where(legal_mask)[0]
+    if len(legal_actions) == 0:
+        legal_actions = torch.tensor([cur_policy_logits.argmax().item()], device=device)
+
+    k = min(NUM_SAMPLED_ACTIONS, len(legal_actions))
+    top_k_idx = legal_actions[torch.topk(samples[legal_actions], k).indices]
+    root.sampled_actions = set(int(a) for a in top_k_idx.cpu().numpy())
 
     # Sequential halving over root actions
-    roots = [int(a) for a in top_k_idx]
+    roots = [int(a) for a in top_k_idx.cpu().numpy()]
     remain = k
-    simulation_budget_per_node = NUM_SIMS_IN_SEARCH // NUM_SAMPLED_ACTIONS
+    simulation_budget_per_node = max(
+        1,
+        NUM_SIMS_IN_SEARCH
+        // (NUM_SAMPLED_ACTIONS * np.ceil(np.log2(NUM_SAMPLED_ACTIONS))),
+    )
 
     while remain > 1:
         for action_idx in roots:
@@ -161,7 +173,8 @@ def get_target_policy(
         )
 
     target_policy = torch.ones_like(cur_policy_logits) * -float("inf")
-    for action_idx in top_k_idx:
+    for action_idx in top_k_idx.cpu().numpy():
+        action_idx = int(action_idx)
         cq = root.completedQ(action_idx, root.policy_weighted_average_values())
         target_policy[action_idx] = root.policy_logits[action_idx] + root.sigma(cq)
     target_policy = torch.softmax(target_policy, dim=0)
@@ -208,7 +221,9 @@ def _expand(path: List[TreeNode], action: int, nets: Networks):
         )
 
         # Sample child candidates for this new node
-        gumbel = torch.from_numpy(_rng().gumbel(size=action_space_size)).to(device)
+        gumbel = torch.from_numpy(
+            _rng().gumbel(size=action_space_size).astype(np.float32)
+        ).to(device)
         samples = gumbel + policy_logits
         child_k = 10
         child_top_k = torch.topk(samples, child_k).indices.cpu().numpy()

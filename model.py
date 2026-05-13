@@ -165,8 +165,8 @@ def generateMoveLookup():
 MOVE_LOOKUP = generateMoveLookup()
 
 
-def create_mask(board):
-    mask = torch.full((73, 8, 8), -1e9)
+def create_mask(board, device: torch.device):
+    mask = torch.full((73, 8, 8), -1e9, device=device)
     for move in board.legal_moves:
         uci = move.uci()
         if uci in MOVE_LOOKUP:
@@ -182,11 +182,9 @@ class Policy(nn.Module):
         super().__init__()
 
         self.conv1 = nn.Conv2d(convChannels, actionChannels, kernel_size=1)
-        self.bn1 = nn.BatchNorm2d(actionChannels)
 
     def forward(self, x, masks):
         logits = self.conv1(x)
-        logits = self.bn1(logits)
 
         batch_size = logits.size(0)
         logits = logits.reshape(batch_size, -1)
