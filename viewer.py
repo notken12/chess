@@ -21,7 +21,6 @@ from collections import deque
 from typing import Optional
 
 import chess
-import chess.svg
 import torch
 from flask import Flask, Response, jsonify, request
 
@@ -178,9 +177,12 @@ HTML = """<!doctype html>
 <html>
 <head>
 <title>chess viewer</title>
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/chessground@9/assets/chessground.base.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/chessground@9/assets/chessground.brown.css">
+<link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/chessground@9/assets/chessground.cburnett.css">
 <style>
   body { font-family: monospace; margin: 20px; background: #1e1e1e; color: #ddd; }
-  #board svg { width: 480px; height: 480px; }
+  #board { width: 480px; height: 480px; }
   #info { margin-top: 12px; line-height: 1.6; }
   #info span { color: #8cf; }
   input { background: #2a2a2a; color: #ddd; border: 1px solid #444; padding: 2px 6px; }
@@ -197,15 +199,32 @@ HTML = """<!doctype html>
   <div>
     delay (s):
     <input id="delay" type="number" step="0.1" min="0" value="1.0" />
-    <button onclick="setDelay()">apply</button>
+    <button id="apply">apply</button>
   </div>
 </div>
-<script>
+<script type="module">
+  import { Chessground } from 'https://cdn.jsdelivr.net/npm/chessground@9/+esm';
+
+  const cg = Chessground(document.getElementById('board'), {
+    viewOnly: true,
+    coordinates: true,
+    animation: { enabled: true, duration: 200 },
+    highlight: { lastMove: true, check: true },
+  });
+
+  function uciToSquares(uci) {
+    if (!uci) return undefined;
+    return [uci.slice(0, 2), uci.slice(2, 4)];
+  }
+
   function refresh() {
-    fetch('/board.svg?t=' + Date.now()).then(r => r.text()).then(svg => {
-      document.getElementById('board').innerHTML = svg;
-    });
     fetch('/state').then(r => r.json()).then(s => {
+      const turn = s.fen.split(' ')[1] === 'w' ? 'white' : 'black';
+      cg.set({
+        fen: s.fen,
+        turnColor: turn,
+        lastMove: uciToSquares(s.lastmove),
+      });
       document.getElementById('ply').textContent = s.ply;
       document.getElementById('lastmove').textContent = s.lastmove || '-';
       document.getElementById('result').textContent = s.result || '-';
@@ -215,10 +234,13 @@ HTML = """<!doctype html>
       }
     });
   }
+
   function setDelay() {
     const v = document.getElementById('delay').value;
     fetch('/set_delay?value=' + v, { method: 'POST' });
   }
+  document.getElementById('apply').addEventListener('click', setDelay);
+
   const params = new URLSearchParams(window.location.search);
   if (params.has('delay')) {
     document.getElementById('delay').value = params.get('delay');
@@ -243,14 +265,6 @@ def make_app(state: ViewerState) -> Flask:
     @app.route("/state")
     def get_state():
         return jsonify(state.snapshot())
-
-    @app.route("/board.svg")
-    def board_svg():
-        s = state.snapshot()
-        board = chess.Board(s["fen"])
-        lastmove = chess.Move.from_uci(s["lastmove"]) if s["lastmove"] else None
-        svg = chess.svg.board(board, lastmove=lastmove, size=480)
-        return Response(svg, mimetype="image/svg+xml")
 
     @app.route("/set_delay", methods=["POST", "GET"])
     def set_delay():
