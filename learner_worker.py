@@ -64,6 +64,14 @@ class Learner:
         latent = self.representation(obs_0)
 
         total_loss = torch.tensor(0.0, device=self.device)
+        loss_accum = {
+            "total": 0.0,
+            "policy": 0.0,
+            "value": 0.0,
+            "reward": 0.0,
+            "consistency": 0.0,
+            "entropy": 0.0,
+        }
 
         move_masks = batch["move_masks"]  # (B,K,4672)
 
@@ -86,8 +94,12 @@ class Learner:
             num_valid_k = mask_k.sum()
             if num_valid_k == 0:
                 continue
-            total_loss += POLICY_LOSS_COEFF * (p_loss * mask_k).sum() / num_valid_k
-            total_loss += VALUE_LOSS_COEFF * (v_loss * mask_k).sum() / num_valid_k
+            p_mean = (p_loss * mask_k).sum() / num_valid_k
+            v_mean = (v_loss * mask_k).sum() / num_valid_k
+            total_loss += POLICY_LOSS_COEFF * p_mean
+            total_loss += VALUE_LOSS_COEFF * v_mean
+            loss_accum["policy"] += p_mean.item()
+            loss_accum["value"] += v_mean.item()
 
             # --- Transitions ---
             if k < UNROLL_STEPS - 1:
@@ -105,18 +117,18 @@ class Learner:
                 # Entropy regularization on policy at step k
                 e_loss = self.compute_entropy_loss(pred_policy_logits)
                 # Reward and entropy: supervise if step k is real
-                total_loss += REWARD_LOSS_COEFF * (r_loss * mask_k).sum() / num_valid_k
-                total_loss += (
-                    POLICY_ENTROPY_LOSS_COEFF * (e_loss * mask_k).sum() / num_valid_k
-                )
+                r_mean = (r_loss * mask_k).sum() / num_valid_k
+                e_mean = (e_loss * mask_k).sum() / num_valid_k
+                total_loss += REWARD_LOSS_COEFF * r_mean
+                total_loss += POLICY_ENTROPY_LOSS_COEFF * e_mean
+                loss_accum["reward"] += r_mean.item()
+                loss_accum["entropy"] += e_mean.item()
                 # Consistency: only if next state is also real
                 cons_mask = valid[:, k] & valid[:, k + 1]
                 if cons_mask.any():
-                    total_loss += (
-                        CONSISTENCY_LOSS_COEFF
-                        * (c_loss * cons_mask).sum()
-                        / cons_mask.sum()
-                    )
+                    c_mean = (c_loss * cons_mask).sum() / cons_mask.sum()
+                    total_loss += CONSISTENCY_LOSS_COEFF * c_mean
+                    loss_accum["consistency"] += c_mean.item()
                 # Gradient scaling for BPTT
                 latent = next_latent
                 latent.register_hook(lambda grad: grad * 0.5)
@@ -128,6 +140,9 @@ class Learner:
 
         if training_step % self.target_net_update_interval == 0:
             self.update_target_networks()
+
+        loss_accum["total"] = float(total_loss.item())
+        return loss_accum
 
     # --- Loss Helper Functions ---
     # these all return all per-sample losses (B,)

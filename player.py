@@ -1,5 +1,5 @@
 from collections import deque
-from typing import List
+from typing import List, Optional, Tuple
 import copy
 
 import chess
@@ -10,6 +10,9 @@ from tree import get_target_policy
 from replay_buffer import Step, save_to_replay_buffer
 from hyperparams import SELF_PLAY_NET_UPDATE_INTERVAL
 import torch
+
+
+GameResult = Tuple[List[Step], Optional[bool]]  # (history, winner: True=W, False=B, None=draw)
 
 
 class SelfPlayWorker:
@@ -45,7 +48,7 @@ class SelfPlayWorker:
             return True
         return False
 
-    def play_game(self) -> List[Step]:
+    def play_game(self) -> GameResult:
         return _play_game(self.nets)
 
 
@@ -105,7 +108,7 @@ def action_to_chess_move(
     return move
 
 
-def _play_game(nets: Networks) -> List[Step]:
+def _play_game(nets: Networks) -> GameResult:
     history: List[Step] = []
     board = chess.Board()
     # Rolling window of board snapshots always encoded from white's perspective,
@@ -147,4 +150,6 @@ def _play_game(nets: Networks) -> List[Step]:
         reward = 1 if outcome and outcome.winner is not None else 0
         history.append((observation, target_action, reward, mask))
     save_to_replay_buffer(history)
-    return history
+    final_outcome = board.outcome()
+    winner = final_outcome.winner if final_outcome else None
+    return history, winner

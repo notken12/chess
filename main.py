@@ -1,50 +1,93 @@
+import argparse
+import os
+
 import torch
 
 from batch_worker import BATCH_SIZE, provide_batch_transitions
+from checkpoint import latest_checkpoint, load_checkpoint, save_checkpoint
 from learner_worker import Learner
 from model import build_networks
 from player import SelfPlayWorker
 from replay_buffer import get_num_episodes
+from training_logger import TrainingLogger
+
 
 DEVICE = torch.device(
     "cuda"
     if torch.cuda.is_available()
     else ("mps" if torch.backends.mps.is_available() else "cpu")
 )
-MAX_STEPS = 10000
-GAMES_PER_ITER = 4
+
+# How often to write a checkpoint (in train steps). Tune to balance disk + safety.
+CHECKPOINT_EVERY = 500
+# How often (in train steps) to print/log a row.
+LOG_EVERY = 1
+CHECKPOINT_DIR = "checkpoints"
+LOG_DIR = "logs"
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint if present.")
+    parser.add_argument("--max-steps", type=int, default=10_000)
+    parser.add_argument("--games-per-iter", type=int, default=4)
+    args = parser.parse_args()
+
     nets = build_networks(device=DEVICE)
     learner = Learner(
         nets.representation, nets.dynamics, nets.policy, nets.value, lr=3e-4
     )
-    learner.update_target_networks()
     self_play_worker = SelfPlayWorker(nets)
+    logger = TrainingLogger(log_dir=LOG_DIR)
 
     step = 0
-    while step < MAX_STEPS:
-        # self play worker: collect games with live networks
-        # later, make this its own thread and get rid of GAMES_PER_ITER in favor of constant running
-        self_play_worker.maybe_update(nets, step)
-        with torch.no_grad():
-            for _ in range(GAMES_PER_ITER):
-                self_play_worker.play_game()
+    if args.resume:
+        ckpt = latest_checkpoint(CHECKPOINT_DIR)
+        if ckpt is not None:
+            step = load_checkpoint(ckpt, learner)
+            print(f"Resumed from {ckpt} at step {step}", flush=True)
+        else:
+            print("No checkpoint found; starting fresh.", flush=True)
 
-        # batch worker
-        if get_num_episodes() >= BATCH_SIZE:
-            batch = provide_batch_transitions(step, nets, learner.target_nets)
-            if batch is not None:
-                # learner worker
-                nets.train()
-                learner.update_step(batch, step)
-                step += 1
+    print(f"Device: {DEVICE}", flush=True)
+    print(
+        f"Need {BATCH_SIZE} episodes in buffer before training starts. "
+        f"Currently: {get_num_episodes()}",
+        flush=True,
+    )
 
-        if step % 100 == 0:
-            print(f"Step {step}, episodes in buffer: {get_num_episodes()}")
+    try:
+        while step < args.max_steps:
+            # Self-play with the (periodically refreshed) snapshot.
+            self_play_worker.maybe_update(nets, step)
+            with torch.no_grad():
+                for _ in range(args.games_per_iter):
+                    history, winner = self_play_worker.play_game()
+                    logger.record_game(len(history), winner)
 
-    print("Training finished.")
+            # Train step once buffer is full enough.
+            if get_num_episodes() >= BATCH_SIZE:
+                batch = provide_batch_transitions(step, nets, learner.target_nets)
+                if batch is not None:
+                    nets.train()
+                    losses = learner.update_step(batch, step)
+                    step += 1
+
+                    if step % LOG_EVERY == 0:
+                        logger.log_step(step, losses, get_num_episodes())
+
+                    if step % CHECKPOINT_EVERY == 0:
+                        ckpt_path = os.path.join(CHECKPOINT_DIR, f"ckpt_{step}.pt")
+                        save_checkpoint(ckpt_path, learner, step)
+                        print(f"Saved checkpoint: {ckpt_path}", flush=True)
+
+    except KeyboardInterrupt:
+        print("\nInterrupted. Saving final checkpoint...", flush=True)
+    finally:
+        final_path = os.path.join(CHECKPOINT_DIR, f"ckpt_{step}.pt")
+        save_checkpoint(final_path, learner, step)
+        print(f"Final checkpoint: {final_path}", flush=True)
+        logger.close()
 
 
 if __name__ == "__main__":
