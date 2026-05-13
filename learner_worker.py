@@ -13,7 +13,7 @@ from hyperparams import (
     UNROLL_STEPS,
     VALUE_LOSS_COEFF,
 )
-from model import Networks
+from model import Networks, ProjectionHead, PredictionHead
 from batch_worker import provide_batch_transitions
 from tree import value_bins  # For move encoding and categorical support
 
@@ -33,18 +33,23 @@ class Learner:
         self.dynamics = dynamics
         self.policy = policy
         self.value = value
-        self.nets = Networks(representation, dynamics, policy, value)
+        self.device = next(self.representation.parameters()).device
+        self.projector = ProjectionHead(in_channels=256).to(self.device)
+        self.predictor = PredictionHead().to(self.device)
+        self.nets = Networks(
+            representation, dynamics, policy, value, self.projector, self.predictor
+        )
         self.target_nets = copy.deepcopy(self.nets)
         self.target_net_update_interval = target_net_update_interval
-
-        self.device = next(self.representation.parameters()).device
 
         # 2. Optimization Setup
         self.optimizer = optim.Adam(
             list(self.representation.parameters())
             + list(self.dynamics.parameters())
             + list(self.policy.parameters())
-            + list(self.value.parameters()),
+            + list(self.value.parameters())
+            + list(self.projector.parameters())
+            + list(self.predictor.parameters()),
             lr=lr,
         )
 
@@ -140,9 +145,12 @@ class Learner:
         )  # (B,)
 
     def compute_consistency_loss(self, pred_latent, real_latent):
-        p = F.normalize(pred_latent.flatten(1), p=2, dim=1)
-        r = F.normalize(real_latent.flatten(1), p=2, dim=1)
-        return F.mse_loss(p, r, reduction="none").mean(dim=1)  # (B,)
+        # SimSiam-style: predictor on pred side, stop-grad on target side.
+        z_pred = self.nets.projector(pred_latent)
+        p_pred = self.nets.predictor(z_pred)
+        with torch.no_grad():
+            z_real = self.target_nets.projector(real_latent)
+        return -F.cosine_similarity(p_pred, z_real, dim=-1)
 
     def compute_entropy_loss(self, pred_logits):
         probs = F.softmax(pred_logits, dim=1)
