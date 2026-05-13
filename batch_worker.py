@@ -2,13 +2,10 @@ from concurrent.futures import ThreadPoolExecutor
 from typing import NamedTuple
 
 import torch
-from tensordict import TensorDict
 
+from model import Networks
 from replay_buffer import K_STEPS, L_STEPS, get_num_episodes, sample_batch
 from tree import get_target_policy, value_bins
-from model import Representation, Dynamics, Policy, Value
-
-
 
 # EfficientZero V2 mixed value target thresholds.
 # Before T1 training steps, the value network is too inaccurate to rely on
@@ -28,9 +25,11 @@ class _ReanalysisResult(NamedTuple):
     mcts_value: float
 
 
-def _reanalyze(latent: torch.Tensor, policy_logits: torch.Tensor, nets: Networks) -> _ReanalysisResult:
+def _reanalyze(
+    latent: torch.Tensor, policy_logits: torch.Tensor, target_nets: Networks
+) -> _ReanalysisResult:
     """Run MCTS for one latent state; return the improved policy and root value."""
-    _, target_policy, mcts_value = get_target_policy(latent, policy_logits, nets)
+    _, target_policy, mcts_value = get_target_policy(latent, policy_logits, target_nets)
     return _ReanalysisResult(target_policy, mcts_value)
 
 
@@ -67,43 +66,50 @@ def _build_td_targets(
     return td_targets
 
 
-def provide_batch_transitions(training_step: int, nets: Networks):
+def provide_batch_transitions(
+    training_step: int, nets: Networks, target_nets: Networks
+):
     num_games = get_num_episodes()
     if num_games < BATCH_SIZE:
         return None
     batch = sample_batch(batch_size=BATCH_SIZE)
     observations = batch["observations"]  # (B, K+L, 8, 8, 119)
     # observations shape: (B, K+L, 8, 8, 119)
-    obs_chw = observations.permute(0, 1, 4, 2, 3) 
+    obs_chw = observations.permute(0, 1, 4, 2, 3)
     # new shape: (B, K+L, 119, 8, 8)
     rewards = batch["rewards"]  # (B, K+L)
     mask = batch["mask"]  # (B, K+L)
     B = observations.shape[0]
 
     # --- Reanalysis: MCTS on the K unroll steps only ---
-    unroll_obs = obs_chw[:, :K_STEPS] # (B*K, 119, 8, 8)
-    unroll_obs_flat = unroll_obs.flatten(0,1)
+    unroll_obs = obs_chw[:, :K_STEPS]  # (B*K, 119, 8, 8)
+    unroll_obs_flat = unroll_obs.flatten(0, 1)
     with torch.no_grad():
-        latents_flat = nets.representation(unroll_obs_flat) # (B*K, 256, 8, 8)
-        logits_flat = nets.policy(latents_flat, boards=None) # (B*K, A)
+        latents_flat = nets.representation(unroll_obs_flat)  # (B*K, 256, 8, 8)
+        logits_flat = nets.policy(latents_flat, boards=None)  # (B*K, A)
 
     # Parallel MCTS for all B*K unroll positions.
     # tree.py uses thread-local RNGs so workers don't corrupt each other's state.
     with ThreadPoolExecutor() as executor:
-        results = list(executor.map(lambda lp: _reanalyze(lp[0], lp[1], nets),
-                                  zip(latents_flat, logits_flat)))
+        results = list(
+            executor.map(
+                lambda lp: _reanalyze(lp[0], lp[1], target_nets),
+                zip(latents_flat, logits_flat),
+            )
+        )
     target_policies = torch.stack([r.target_policy for r in results]).view(
         B, K_STEPS, -1
     )
-    mcts_values = torch.tensor([r.mcts_value for r in results], device=observations.device).view(B, K_STEPS)
+    mcts_values = torch.tensor(
+        [r.mcts_value for r in results], device=observations.device
+    ).view(B, K_STEPS)
 
     # --- Bootstrap values: V(s_{t+j+L}) for each unroll position j ---
     # The bootstrap for position j sits at window index j+L, spanning L..K+L-1.
     boot_obs = obs_chw[:, L_STEPS : K_STEPS + L_STEPS]  # (B, K, 8, 8, 119)
     boot_obs_flat = boot_obs.flatten(0, 1)  # (B*K, 8, 8, 119)
     with torch.no_grad():
-
-        boot_latents = nets.representation(boot_obs_flat) # (B*K, 256, 8, 8)
+        boot_latents = nets.representation(boot_obs_flat)  # (B*K, 256, 8, 8)
         boot_value_logits = nets.value(boot_latents)  # (B*K, num_bins)
         # Convert bins back to a single scalar value
         boot_value_probs = torch.softmax(boot_value_logits, dim=-1)
@@ -114,7 +120,9 @@ def provide_batch_transitions(training_step: int, nets: Networks):
     # Zero out positions where the game had already ended.
     bootstrap_values = bootstrap_values * mask[:, L_STEPS : K_STEPS + L_STEPS]
 
-    td_targets = _build_td_targets(rewards[:, :K_STEPS + L_STEPS], bootstrap_values)  # (B, K)
+    td_targets = _build_td_targets(
+        rewards[:, : K_STEPS + L_STEPS], bootstrap_values
+    )  # (B, K)
 
     # --- Mixed value target (EfficientZero V2) ---
     #   condition 1 — early training: value net not yet reliable, always use TD
