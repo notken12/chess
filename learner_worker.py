@@ -40,6 +40,7 @@ class Learner:
             representation, dynamics, policy, value, self.projector, self.predictor
         )
         self.target_nets = copy.deepcopy(self.nets)
+        self._freeze_target_nets()
         self.target_net_update_interval = target_net_update_interval
 
         # 2. Optimization Setup
@@ -159,6 +160,22 @@ class Learner:
 
     def update_target_networks(self):
         self.target_nets = copy.deepcopy(self.nets)
+        self._freeze_target_nets()
+
+    def _freeze_target_nets(self):
+        """Set target_nets to eval (BN uses running stats, no NaN with batch=1
+        in MCTS expansion) and disable grads (no accidental updates)."""
+        self.target_nets.eval()
+        for m in (
+            self.target_nets.representation,
+            self.target_nets.dynamics,
+            self.target_nets.policy,
+            self.target_nets.value,
+            self.target_nets.projector,
+            self.target_nets.predictor,
+        ):
+            for p in m.parameters():
+                p.requires_grad = False
 
     def encode_action(self, action_indices):
         """convert one hot encoding to full tensor"""
@@ -174,17 +191,19 @@ class Learner:
 
     def scalar_to_categorical(self, v):
         # Maps float value to the 51-bin histogram
+        bins = self.value_bins.to(v.device)
+        num_bins = len(bins)
         v = v.clamp(-1, 1)
-        bin_width = self.value_bins[1] - self.value_bins[0]
-        centered_v = (v - self.value_bins[0]) / bin_width
-        low = centered_v.floor().long()
-        high = (low + 1).clamp(0, len(self.value_bins) - 1)
-        w_high = centered_v - low
-        dist = torch.zeros((v.size(0), len(self.value_bins)), device=v.device)
-        dist.scatter_(
-            1,
-            low.unsqueeze(1).clamp(0, len(self.value_bins) - 1),
-            (1 - w_high).unsqueeze(1),
-        )
-        dist.scatter_(1, high.unsqueeze(1), w_high.unsqueeze(1))
+        bin_width = bins[1] - bins[0]
+        centered_v = (v - bins[0]) / bin_width
+        low = centered_v.floor().long().clamp(0, num_bins - 1)
+        high = (low + 1).clamp(0, num_bins - 1)
+        w_high = centered_v - low.float()
+        dist = torch.zeros((v.size(0), num_bins), device=v.device)
+        # scatter_add_ instead of scatter_: when low == high (v on a bin
+        # boundary, e.g. v ≈ +1), both writes go to the same slot. Adding
+        # accumulates to (1 - w_high) + w_high = 1; plain scatter would
+        # overwrite the first write with w_high ≈ 0.
+        dist.scatter_add_(1, low.unsqueeze(1), (1 - w_high).unsqueeze(1))
+        dist.scatter_add_(1, high.unsqueeze(1), w_high.unsqueeze(1))
         return dist

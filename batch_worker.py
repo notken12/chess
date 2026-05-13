@@ -31,8 +31,12 @@ def _build_td_targets(
     """
     Compute l-step TD targets for every position in the K-step unroll window.
 
+    Two-player zero-sum (negamax): rewards/values flip sign each ply, so each
+    successive step contributes with discount (-γ)^i instead of γ^i.
+
     For each unroll position j in [0, K):
-        G[b, j] = Σ_{i=0}^{L-1} γ^i · rewards[b, j+i]  +  γ^L · V_boot[b, j]
+        G[b, j] = Σ_{i=0}^{L-1} (-γ)^i · rewards[b, j+i]
+                + (-γ)^L · V_boot[b, j]
 
     rewards has shape (B, K+L) so that rewards[b, j:j+L] is always in-bounds.
     bootstrap_values[b, j] = V(s_{t+j+L}), obtained by running the representation
@@ -50,10 +54,13 @@ def _build_td_targets(
     gather_idx = j_idx + i_idx  # (K, L)
 
     reward_windows = rewards[:, gather_idx]  # (B, K, L)
-    discounts = GAMMA ** torch.arange(L, dtype=torch.float32, device=device)  # (L,)
+    i_range = torch.arange(L, dtype=torch.float32, device=device)
+    signs = (-1.0) ** i_range  # alternates +1, -1, +1, ...
+    discounts = signs * (GAMMA**i_range)  # (L,)
     td_from_rewards = (reward_windows * discounts).sum(dim=-1)  # (B, K)
 
-    td_targets = td_from_rewards + GAMMA**L * bootstrap_values  # (B, K)
+    bootstrap_sign = (-1.0) ** L
+    td_targets = td_from_rewards + bootstrap_sign * (GAMMA**L) * bootstrap_values
     return td_targets
 
 
