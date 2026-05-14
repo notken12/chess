@@ -6,6 +6,7 @@ import copy
 
 from hyperparams import (
     CONSISTENCY_LOSS_COEFF,
+    LR,
     POLICY_ENTROPY_LOSS_COEFF,
     POLICY_LOSS_COEFF,
     REWARD_LOSS_COEFF,
@@ -15,7 +16,7 @@ from hyperparams import (
 )
 from model import Networks, ProjectionHead, PredictionHead
 from batch_worker import provide_batch_transitions
-from tree import value_bins  # For move encoding and categorical support
+from tree import value_bins, reward_bins  # For move encoding and categorical support
 
 
 class Learner:
@@ -25,7 +26,7 @@ class Learner:
         dynamics,
         policy,
         value,
-        lr=1e-4,
+        lr=LR,
         target_net_update_interval=TARGET_NET_UPDATE_INTERVAL,
     ):
         # 1. Main Networks (The "Live" Weights)
@@ -43,19 +44,22 @@ class Learner:
         self._freeze_target_nets()
         self.target_net_update_interval = target_net_update_interval
 
-        # 2. Optimization Setup
-        self.optimizer = optim.Adam(
+        # 2. Optimization Setup (SGD for discrete/vision tasks per EZ-V2 Table 3)
+        params = (
             list(self.representation.parameters())
             + list(self.dynamics.parameters())
             + list(self.policy.parameters())
             + list(self.value.parameters())
             + list(self.projector.parameters())
-            + list(self.predictor.parameters()),
-            lr=lr,
+            + list(self.predictor.parameters())
+        )
+        self.optimizer = optim.SGD(
+            params, lr=lr, momentum=0.9, weight_decay=1e-4
         )
 
         # 3. Helper Metadata
         self.value_bins = value_bins  # torch.linspace(-1, 1, num_bins)
+        self.reward_bins = reward_bins
 
     def update_step(self, batch, training_step):
         batch = batch.to(self.device)
@@ -155,10 +159,8 @@ class Learner:
         return -(target_dist * F.log_softmax(pred_logits, dim=1)).sum(dim=1)  # (B,)
 
     def compute_reward_loss(self, pred_logits, target_reward):
-        # Maps -1, 0, 1 to class indices 0, 1, 2
-        return F.cross_entropy(
-            pred_logits, (target_reward + 1).long(), reduction="none"
-        )  # (B,)
+        target_dist = self.scalar_to_categorical(target_reward, bins=self.reward_bins)
+        return -(target_dist * F.log_softmax(pred_logits, dim=1)).sum(dim=1)  # (B,)
 
     def compute_consistency_loss(self, pred_latent, real_latent):
         # SimSiam-style: predictor on pred side, stop-grad on target side.
@@ -204,11 +206,13 @@ class Learner:
             action_tensor[b, z, x, y] = 1.0
         return action_tensor
 
-    def scalar_to_categorical(self, v):
+    def scalar_to_categorical(self, v, bins=None):
         # Maps float value to the 51-bin histogram
-        bins = self.value_bins.to(v.device)
+        if bins is None:
+            bins = self.value_bins
+        bins = bins.to(v.device)
         num_bins = len(bins)
-        v = v.clamp(-1, 1)
+        v = v.clamp(bins[0], bins[-1])
         bin_width = bins[1] - bins[0]
         centered_v = (v - bins[0]) / bin_width
         low = centered_v.floor().long().clamp(0, num_bins - 1)

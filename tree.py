@@ -93,7 +93,7 @@ class TreeNode:
 
 action_space_size = 8 * 8 * 73
 value_bins = torch.linspace(-1, 1, 51)
-reward_bins = torch.tensor([-1, 0, 1])
+reward_bins = torch.linspace(-1, 1, 51)
 
 _thread_local = threading.local()
 
@@ -118,7 +118,7 @@ def get_target_policy(
         value_logits = nets.value(cur_latent)
         value_pred = torch.softmax(value_logits, dim=-1).squeeze(0)
 
-    reward_pred = torch.zeros(3, device=device)
+    reward_pred = torch.zeros(51, device=device)
 
     root = TreeNode(
         latent=cur_latent,
@@ -172,10 +172,10 @@ def get_target_policy(
             c.num_visits for c in root.children.values()
         )
 
-    target_policy = torch.ones_like(cur_policy_logits) * -float("inf")
-    for action_idx in top_k_idx.cpu().numpy():
-        action_idx = int(action_idx)
-        cq = root.completedQ(action_idx, root.policy_weighted_average_values())
+    pwav = root.policy_weighted_average_values()
+    target_policy = torch.zeros_like(cur_policy_logits)
+    for action_idx in range(action_space_size):
+        cq = root.completedQ(action_idx, pwav)
         target_policy[action_idx] = root.policy_logits[action_idx] + root.sigma(cq)
     target_policy = torch.softmax(target_policy, dim=0)
     return root_action, target_policy, root.average_value
@@ -225,7 +225,7 @@ def _expand(path: List[TreeNode], action: int, nets: Networks):
             _rng().gumbel(size=action_space_size).astype(np.float32)
         ).to(device)
         samples = gumbel + policy_logits
-        child_k = 10
+        child_k = NUM_SAMPLED_ACTIONS
         child_top_k = torch.topk(samples, child_k).indices.cpu().numpy()
         node.sampled_actions = set(int(a) for a in child_top_k)
 

@@ -35,7 +35,7 @@ def main():
 
     nets = build_networks(device=DEVICE)
     learner = Learner(
-        nets.representation, nets.dynamics, nets.policy, nets.value, lr=3e-4
+        nets.representation, nets.dynamics, nets.policy, nets.value
     )
     self_play_worker = SelfPlayWorker(nets)
     logger = TrainingLogger(log_dir=LOG_DIR)

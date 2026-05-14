@@ -144,10 +144,11 @@ def _play_game(nets: Networks) -> GameResult:
             action_to_chess_move(target_action, board, board.turn == chess.BLACK)
         )
         outcome = board.outcome()
-        # if the game isn't over or it's a draw, we give a reward of 0
-        # if our last move made us win, we give a reward of 1
-        # there is no way to lose from making a move.
-        reward = 1 if outcome and outcome.winner is not None else 0
+        if outcome and outcome.winner is not None:
+            # board.turn is the player to move next; the player who just moved is not board.turn.
+            reward = 1 if outcome.winner == (not board.turn) else -1
+        else:
+            reward = 0
         history.append((observation, target_action, reward, mask))
     save_to_replay_buffer(history)
     final_outcome = board.outcome()

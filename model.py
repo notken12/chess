@@ -62,7 +62,7 @@ class Dynamics(nn.Module):
         self.relu = nn.ReLU()
         self.resblocks = nn.Sequential(*[ResBlock(convChannels) for _ in range(10)])
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
-        self.linear = nn.Linear(256, 3)
+        self.linear = nn.Linear(256, 51)
 
     def forward(self, state, action):
         combined = torch.cat((state, action), dim=1)
