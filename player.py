@@ -3,6 +3,7 @@ from datetime import datetime
 from typing import List, Optional, Tuple
 import copy
 import os
+import time
 
 import chess
 import chess.pgn
@@ -15,7 +16,7 @@ from hyperparams import SELF_PLAY_NET_UPDATE_INTERVAL
 import torch
 
 
-GameResult = Tuple[List[Step], Optional[bool]]  # (history, winner: True=W, False=B, None=draw)
+GameResult = Tuple[List[Step], Optional[bool], float]  # (history, winner, elapsed_s)
 
 
 class SelfPlayWorker:
@@ -112,6 +113,7 @@ def action_to_chess_move(
 
 
 def _play_game(nets: Networks) -> GameResult:
+    start = time.perf_counter()
     history: List[Step] = []
     board = chess.Board()
     # Rolling window of board snapshots always encoded from white's perspective,
@@ -122,11 +124,11 @@ def _play_game(nets: Networks) -> GameResult:
     while not board.is_game_over():
         # Always encode from white's perspective: mirror the board when it's
         # black's turn.
-        real_board = copy.deepcopy(board)
+        real_board = board.copy()
         board_history.appendleft(real_board)
         if board.turn == chess.BLACK:
-            obs_board = copy.deepcopy(board).mirror()
-            obs_history = [copy.deepcopy(b).mirror() for b in board_history]
+            obs_board = board.copy().mirror()
+            obs_history = [b.copy().mirror() for b in board_history]
         else:
             obs_board = real_board
             obs_history = list(board_history)
@@ -166,4 +168,5 @@ def _play_game(nets: Networks) -> GameResult:
     with open(pgn_path, "w") as f:
         f.write(str(game) + "\n")
 
-    return history, winner
+    elapsed = time.perf_counter() - start
+    return history, winner, elapsed

@@ -69,7 +69,7 @@ def main():
             self_play_worker.maybe_update(nets, step)
             with torch.no_grad():
                 for _ in range(args.games_per_iter):
-                    history, winner = self_play_worker.play_game()
+                    history, winner, elapsed = self_play_worker.play_game()
                     logger.record_game(len(history), winner)
                     n = get_num_episodes()
                     result = (
@@ -77,7 +77,7 @@ def main():
                     )
                     print(
                         f"  game done: plies={len(history):>3d} result={result:<5s} "
-                        f"buffer={n}/{BATCH_SIZE}",
+                        f"time={elapsed:.1f}s buffer={n}/{BATCH_SIZE}",
                         flush=True,
                     )
 
