@@ -1,8 +1,11 @@
 from collections import deque
+from datetime import datetime
 from typing import List, Optional, Tuple
 import copy
+import os
 
 import chess
+import chess.pgn
 
 from model import Networks, create_mask
 from observation import NUM_SNAPSHOTS, board_to_observation
@@ -153,4 +156,14 @@ def _play_game(nets: Networks) -> GameResult:
     save_to_replay_buffer(history)
     final_outcome = board.outcome()
     winner = final_outcome.winner if final_outcome else None
+
+    os.makedirs("games", exist_ok=True)
+    game = chess.pgn.Game.from_board(board)
+    game.headers["Result"] = board.result()
+    game.headers["Date"] = datetime.now().strftime("%Y.%m.%d")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    pgn_path = f"games/game_{timestamp}.pgn"
+    with open(pgn_path, "w") as f:
+        f.write(str(game) + "\n")
+
     return history, winner
