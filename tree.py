@@ -143,6 +143,11 @@ def get_target_policy(
     top_k_idx = legal_actions[torch.topk(samples[legal_actions], k).indices]
     root.sampled_actions = set(int(a) for a in top_k_idx.cpu().numpy())
 
+    # Gumbel noise per sampled action must persist across every halving
+    # round: Gumbel sequential halving selects on g(a) + logit(a) + sigma(q(a)),
+    # and reusing the original noise is what makes the selection consistent.
+    g_root = {int(a): gumbel[int(a)].item() for a in top_k_idx.cpu().numpy()}
+
     # Sequential halving over root actions
     roots = [int(a) for a in top_k_idx.cpu().numpy()]
     remain = k
@@ -152,15 +157,17 @@ def get_target_policy(
         // (NUM_SAMPLED_ACTIONS * np.ceil(np.log2(NUM_SAMPLED_ACTIONS))),
     )
 
+    def gumbel_score(a: int, policy_weighted_average_values: float) -> float:
+        cq = root.completedQ(a, policy_weighted_average_values)
+        return g_root[a] + root.policy_logits[a].item() + root.sigma(cq)
+
     while remain > 1:
         for action_idx in roots:
             for _ in range(simulation_budget_per_node):
                 _simulate([root], action_idx, nets)
-        # Eliminate worse half (keep higher completedQ)
-        roots.sort(
-            key=lambda a: root.completedQ(a, root.policy_weighted_average_values()),
-            reverse=True,
-        )
+        # Eliminate worse half by Gumbel score g(a) + logit(a) + sigma(q(a))
+        pwav = root.policy_weighted_average_values()
+        roots.sort(key=lambda a: gumbel_score(a, pwav), reverse=True)
         roots = roots[: remain // 2]
         remain = len(roots)
         simulation_budget_per_node *= 2
