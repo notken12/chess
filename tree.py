@@ -237,37 +237,24 @@ def batched_get_target_policy(latents, policy_logits, nets):
         active.append([int(a) for a in top.cpu().numpy()])
         roots[b].sampled_actions = set(active[-1])
 
-    legal_mask = cur_policy_logits > -1e8  # illegal moves masked to -1e9
-    legal_actions = torch.where(legal_mask)[0]
-    if len(legal_actions) == 0:
-        legal_actions = torch.tensor([cur_policy_logits.argmax().item()], device=device)
+    # Gumbel noise per sampled action per tree must persist across every
+    # halving round: Gumbel sequential halving selects on
+    # g(a) + logit(a) + sigma(q(a)), and reusing the original noise is what
+    # makes the selection consistent across rounds.
+    g_roots = [{a: gumbel[b, a].item() for a in active[b]} for b in range(B)]
 
-    k = min(NUM_SAMPLED_ACTIONS, len(legal_actions))
-    top_k_idx = legal_actions[torch.topk(samples[legal_actions], k).indices]
-    root.sampled_actions = set(int(a) for a in top_k_idx.cpu().numpy())
-
-    # Gumbel noise per sampled action must persist across every halving
-    # round: Gumbel sequential halving selects on g(a) + logit(a) + sigma(q(a)),
-    # and reusing the original noise is what makes the selection consistent.
-    g_root = {int(a): gumbel[int(a)].item() for a in top_k_idx.cpu().numpy()}
-
-    # Sequential halving over root actions
-    roots = [int(a) for a in top_k_idx.cpu().numpy()]
+    num_rounds = max(1, int(np.ceil(np.log2(k))))
     remain = k
-    simulation_budget_per_node = max(
-        1,
-        NUM_SIMS_IN_SEARCH
-        // (NUM_SAMPLED_ACTIONS * np.ceil(np.log2(NUM_SAMPLED_ACTIONS))),
-    )
 
     v_bins = value_bins.to(device)
     r_bins = reward_bins.to(device)
 
-    def gumbel_score(a: int, policy_weighted_average_values: float) -> float:
+    def gumbel_score(root, g_root, a, policy_weighted_average_values):
         cq = root.completedQ(a, policy_weighted_average_values)
         return g_root[a] + root.policy_logits[a].item() + root.sigma(cq)
 
     while remain > 1:
+        sim_budget = max(1, NUM_SIMS_IN_SEARCH // (num_rounds * remain))
         for _ in range(sim_budget):
             # One simulation per active action per tree
             paths = [(b, [roots[b]], a) for b in range(B) for a in active[b]]
@@ -305,17 +292,18 @@ def batched_get_target_policy(latents, policy_logits, nets):
                 leaf_value = torch.sum(leaf.value_pred * v_bins).item()
                 _backprop(path, leaf_value, v_bins, r_bins)
 
-        # Eliminate worse half per tree
+        # Eliminate worse half per tree by Gumbel score
+        # g(a) + logit(a) + sigma(q(a))
         for b in range(B):
+            pwav = roots[b].policy_weighted_average_values()
             active[b].sort(
-                key=lambda a: roots[b].completedQ(
-                    a, roots[b].policy_weighted_average_values()
+                key=lambda a, b=b, pwav=pwav: gumbel_score(
+                    roots[b], g_roots[b], a, pwav
                 ),
                 reverse=True,
             )
             active[b] = active[b][: remain // 2]
         remain = remain // 2
-        sim_budget *= 2
 
     root_actions = torch.tensor(
         [active[b][0] for b in range(B)], device=device, dtype=torch.long
