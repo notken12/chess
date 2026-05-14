@@ -1,4 +1,3 @@
-from concurrent.futures import ThreadPoolExecutor
 from typing import NamedTuple
 
 import torch
@@ -6,22 +5,7 @@ import torch
 from hyperparams import BATCH_SIZE, GAMMA, T1, T2, TD_STEPS, UNROLL_STEPS
 from model import Networks
 from replay_buffer import get_num_episodes, sample_batch
-from tree import get_target_policy, value_bins
-
-
-class _ReanalysisResult(NamedTuple):
-    target_policy: torch.Tensor
-    mcts_value: float
-
-
-def _reanalyze(
-    latent: torch.Tensor, policy_logits: torch.Tensor, target_nets: Networks
-) -> _ReanalysisResult:
-    """Run MCTS for one latent state (without batch dimension); return the improved policy and root value."""
-    _, target_policy, mcts_value = get_target_policy(
-        latent.unsqueeze(0), policy_logits, target_nets
-    )
-    return _ReanalysisResult(target_policy, mcts_value)
+from tree import batched_get_target_policy, value_bins
 
 
 def _build_td_targets(
@@ -98,21 +82,28 @@ def provide_batch_transitions(
             latents_flat, unroll_masks_flat
         )  # (N_valid, A)
 
-    # Run MCTS on valid unroll positions
-    with ThreadPoolExecutor() as executor:
-        results = list(
-            executor.map(
-                lambda lp: _reanalyze(lp[0], lp[1], target_nets),
-                zip(latents_flat, logits_flat),
-            )
-        )
-
-    # Reconstruct (B, K) tensors, zero/one-hot fill for padded positions
+    # Run batched MCTS in chunks to avoid OOM
     A = logits_flat.shape[-1]
     target_policies = torch.zeros(B, UNROLL_STEPS, A, device=device)
     mcts_values = torch.zeros(B, UNROLL_STEPS, device=device)
-    target_policies[valid] = torch.stack([r.target_policy for r in results])
-    mcts_values[valid] = torch.tensor([r.mcts_value for r in results], device=device)
+
+    CHUNK_SIZE = 64
+    N_valid = latents_flat.shape[0]
+    for start in range(0, N_valid, CHUNK_SIZE):
+        end = min(start + CHUNK_SIZE, N_valid)
+        chunk_latents = latents_flat[start:end]
+        chunk_logits = logits_flat[start:end]
+        _, chunk_policies, chunk_values = batched_get_target_policy(
+            chunk_latents, chunk_logits, target_nets
+        )
+        # chunk_policies: (chunk_size, A), chunk_values: (chunk_size,)
+        # We'll place them back after processing all chunks
+        # But we need to know which flat indices correspond to which (B, K) positions
+        # valid_flat is a (B*K,) boolean mask. The valid indices are:
+        valid_indices = torch.where(valid_flat)[0]
+        chunk_indices = valid_indices[start:end]
+        target_policies.view(B * UNROLL_STEPS, A)[chunk_indices] = chunk_policies
+        mcts_values.view(B * UNROLL_STEPS)[chunk_indices] = chunk_values
 
     # --- Bootstrap values: only on valid positions ---
     boot_valid = (step_idx + TD_STEPS) < batch["window_lengths"].unsqueeze(1)  # (B, K)
@@ -131,7 +122,7 @@ def provide_batch_transitions(
 
     # --- Mixed value target (EfficientZero V2) ---
     #   condition 1 — early training: value net not yet reliable, always use TD
-    #   condition 2 — recent games: their MCTS ran on a stale network, use TD
+    #   condition 2 — recent games: their MCTS ran on an older network, use TD
     # Both evaluated without any Python-level branching over B*K.
     game_positions = batch["game_buffer_positions"]  # (B,)
     if training_step < T1:

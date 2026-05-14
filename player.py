@@ -1,8 +1,12 @@
 from collections import deque
+from datetime import datetime
 from typing import List, Optional, Tuple
 import copy
+import os
+import time
 
 import chess
+import chess.pgn
 
 from model import Networks, create_mask
 from observation import NUM_SNAPSHOTS, board_to_observation
@@ -12,7 +16,7 @@ from hyperparams import SELF_PLAY_NET_UPDATE_INTERVAL
 import torch
 
 
-GameResult = Tuple[List[Step], Optional[bool]]  # (history, winner: True=W, False=B, None=draw)
+GameResult = Tuple[List[Step], Optional[bool], float]  # (history, winner, elapsed_s)
 
 
 class SelfPlayWorker:
@@ -109,6 +113,7 @@ def action_to_chess_move(
 
 
 def _play_game(nets: Networks) -> GameResult:
+    start = time.perf_counter()
     history: List[Step] = []
     board = chess.Board()
     # Rolling window of board snapshots always encoded from white's perspective,
@@ -119,11 +124,11 @@ def _play_game(nets: Networks) -> GameResult:
     while not board.is_game_over():
         # Always encode from white's perspective: mirror the board when it's
         # black's turn.
-        real_board = copy.deepcopy(board)
+        real_board = board.copy()
         board_history.appendleft(real_board)
         if board.turn == chess.BLACK:
-            obs_board = copy.deepcopy(board).mirror()
-            obs_history = [copy.deepcopy(b).mirror() for b in board_history]
+            obs_board = board.copy().mirror()
+            obs_history = [b.copy().mirror() for b in board_history]
         else:
             obs_board = real_board
             obs_history = list(board_history)
@@ -144,12 +149,24 @@ def _play_game(nets: Networks) -> GameResult:
             action_to_chess_move(target_action, board, board.turn == chess.BLACK)
         )
         outcome = board.outcome()
-        # if the game isn't over or it's a draw, we give a reward of 0
-        # if our last move made us win, we give a reward of 1
-        # there is no way to lose from making a move.
-        reward = 1 if outcome and outcome.winner is not None else 0
+        if outcome and outcome.winner is not None:
+            # board.turn is the player to move next; the player who just moved is not board.turn.
+            reward = 1 if outcome.winner == (not board.turn) else -1
+        else:
+            reward = 0
         history.append((observation, target_action, reward, mask))
     save_to_replay_buffer(history)
     final_outcome = board.outcome()
     winner = final_outcome.winner if final_outcome else None
-    return history, winner
+
+    os.makedirs("games", exist_ok=True)
+    game = chess.pgn.Game.from_board(board)
+    game.headers["Result"] = board.result()
+    game.headers["Date"] = datetime.now().strftime("%Y.%m.%d")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    pgn_path = f"games/game_{timestamp}.pgn"
+    with open(pgn_path, "w") as f:
+        f.write(str(game) + "\n")
+
+    elapsed = time.perf_counter() - start
+    return history, winner, elapsed

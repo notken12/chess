@@ -1,3 +1,6 @@
+*.pt
+games/
+replay_buffer.pt
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]

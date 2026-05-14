@@ -119,11 +119,11 @@ def play_loop(state: ViewerState, ckpt_dir: str, device: torch.device) -> None:
 
         with torch.no_grad():
             while not board.is_game_over():
-                real_board = copy.deepcopy(board)
+                real_board = board.copy()
                 board_history.appendleft(real_board)
                 if board.turn == chess.BLACK:
-                    obs_board = copy.deepcopy(board).mirror()
-                    obs_history = [copy.deepcopy(b).mirror() for b in board_history]
+                    obs_board = board.copy().mirror()
+                    obs_history = [b.copy().mirror() for b in board_history]
                 else:
                     obs_board = real_board
                     obs_history = list(board_history)
@@ -131,9 +131,7 @@ def play_loop(state: ViewerState, ckpt_dir: str, device: torch.device) -> None:
                 observation = board_to_observation(
                     obs_board, history=list(obs_history)
                 ).to(device)
-                latent = nets.representation(
-                    observation.permute(2, 0, 1).unsqueeze(0)
-                )
+                latent = nets.representation(observation.permute(2, 0, 1).unsqueeze(0))
                 policy_logits = nets.policy(
                     latent,
                     create_mask(obs_board, device=device).view(-1).unsqueeze(0),
