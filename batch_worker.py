@@ -87,7 +87,7 @@ def provide_batch_transitions(
     target_policies = torch.zeros(B, UNROLL_STEPS, A, device=device)
     mcts_values = torch.zeros(B, UNROLL_STEPS, device=device)
 
-    CHUNK_SIZE = 64
+    CHUNK_SIZE = 16
     N_valid = latents_flat.shape[0]
     for start in range(0, N_valid, CHUNK_SIZE):
         end = min(start + CHUNK_SIZE, N_valid)
@@ -102,8 +102,10 @@ def provide_batch_transitions(
         # valid_flat is a (B*K,) boolean mask. The valid indices are:
         valid_indices = torch.where(valid_flat)[0]
         chunk_indices = valid_indices[start:end]
-        target_policies.view(B * UNROLL_STEPS, A)[chunk_indices] = chunk_policies
-        mcts_values.view(B * UNROLL_STEPS)[chunk_indices] = chunk_values
+        flat_policies = target_policies.view(B * UNROLL_STEPS, A)
+        flat_values = mcts_values.view(B * UNROLL_STEPS)
+        flat_policies.index_copy_(0, chunk_indices, chunk_policies)
+        flat_values.index_copy_(0, chunk_indices, chunk_values)
 
     # --- Bootstrap values: only on valid positions ---
     boot_valid = (step_idx + TD_STEPS) < batch["window_lengths"].unsqueeze(1)  # (B, K)

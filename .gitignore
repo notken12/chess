@@ -1,3 +1,4 @@
+EfficientZeroV2
 *.pt
 games/
 replay_buffer.pt

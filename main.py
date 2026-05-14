@@ -17,6 +17,7 @@ DEVICE = torch.device(
     if torch.cuda.is_available()
     else ("mps" if torch.backends.mps.is_available() else "cpu")
 )
+DEVICE = torch.device("cpu")
 
 # How often to write a checkpoint (in train steps). Tune to balance disk + safety.
 CHECKPOINT_EVERY = 500

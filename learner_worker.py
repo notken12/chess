@@ -1,3 +1,4 @@
+import os
 import torch
 import torch.nn.functional as F
 import torch.optim as optim
@@ -17,6 +18,18 @@ from hyperparams import (
 from model import Networks, ProjectionHead, PredictionHead
 from batch_worker import provide_batch_transitions
 from tree import value_bins, reward_bins  # For move encoding and categorical support
+
+
+def _check_tensor(t, name, step, thresh=1e4):
+    """Print diagnostic if tensor contains NaN/Inf or values beyond threshold."""
+    if t is None:
+        return
+    if not torch.isfinite(t).all():
+        bad = (~torch.isfinite(t)).sum().item()
+        print(f"[DIAG step {step}] {name}: {bad}/{t.numel()} non-finite (min={t.min().item():.3e} max={t.max().item():.3e})", flush=True)
+    elif t.abs().max() > thresh:
+        mx = t.abs().max().item()
+        print(f"[DIAG step {step}] {name}: max abs={mx:.3e} (shape={list(t.shape)})", flush=True)
 
 
 class Learner:
@@ -94,12 +107,16 @@ class Learner:
 
             p_loss = self.compute_policy_loss(pred_policy_logits, target_policy)
             v_loss = self.compute_value_loss(pred_value_logits, target_value)
+            _check_tensor(p_loss, f"p_loss_k{k}", training_step)
+            _check_tensor(v_loss, f"v_loss_k{k}", training_step)
             mask_k = valid[:, k]
             num_valid_k = mask_k.sum()
             if num_valid_k == 0:
                 continue
             p_mean = (p_loss * mask_k).sum() / num_valid_k
             v_mean = (v_loss * mask_k).sum() / num_valid_k
+            _check_tensor(p_mean, f"p_mean_k{k}", training_step)
+            _check_tensor(v_mean, f"v_mean_k{k}", training_step)
             total_loss += POLICY_LOSS_COEFF * p_mean
             total_loss += VALUE_LOSS_COEFF * v_mean
             loss_accum["policy"] += p_mean.item()
@@ -113,13 +130,16 @@ class Learner:
                 r_loss = self.compute_reward_loss(
                     pred_reward_logits, batch["rewards"][:, k]
                 )
+                _check_tensor(r_loss, f"r_loss_k{k}", training_step)
                 # Consistency loss: needs step k+1 to also be real
                 real_obs_k = batch["observations"][:, k + 1]
                 with torch.no_grad():
                     real_latent = self.target_nets.representation(real_obs_k)
                 c_loss = self.compute_consistency_loss(next_latent, real_latent)
+                _check_tensor(c_loss, f"c_loss_k{k}", training_step)
                 # Entropy regularization on policy at step k
                 e_loss = self.compute_entropy_loss(pred_policy_logits)
+                _check_tensor(e_loss, f"e_loss_k{k}", training_step)
                 # Reward and entropy: supervise if step k is real
                 r_mean = (r_loss * mask_k).sum() / num_valid_k
                 e_mean = (e_loss * mask_k).sum() / num_valid_k
@@ -131,6 +151,7 @@ class Learner:
                 cons_mask = valid[:, k] & valid[:, k + 1]
                 if cons_mask.any():
                     c_mean = (c_loss * cons_mask).sum() / cons_mask.sum()
+                    _check_tensor(c_mean, f"c_mean_k{k}", training_step)
                     total_loss += CONSISTENCY_LOSS_COEFF * c_mean
                     loss_accum["consistency"] += c_mean.item()
                 # Gradient scaling for BPTT
@@ -138,8 +159,18 @@ class Learner:
                 latent.register_hook(lambda grad: grad * 0.5)
 
         # Optimization Step
+        _check_tensor(total_loss, "total_loss_pre_backward", training_step)
         self.optimizer.zero_grad()
         total_loss.backward()
+        # Check parameter grads
+        for name, p in self.representation.named_parameters():
+            if p.grad is not None:
+                _check_tensor(p.grad, f"rep_grad_{name}", training_step)
+                break
+        for name, p in self.policy.named_parameters():
+            if p.grad is not None:
+                _check_tensor(p.grad, f"pol_grad_{name}", training_step)
+                break
         self.optimizer.step()
 
         if training_step % self.target_net_update_interval == 0:
@@ -218,11 +249,11 @@ class Learner:
         low = centered_v.floor().long().clamp(0, num_bins - 1)
         high = (low + 1).clamp(0, num_bins - 1)
         w_high = centered_v - low.float()
-        dist = torch.zeros((v.size(0), num_bins), device=v.device)
-        # scatter_add_ instead of scatter_: when low == high (v on a bin
-        # boundary, e.g. v ≈ +1), both writes go to the same slot. Adding
-        # accumulates to (1 - w_high) + w_high = 1; plain scatter would
-        # overwrite the first write with w_high ≈ 0.
-        dist.scatter_add_(1, low.unsqueeze(1), (1 - w_high).unsqueeze(1))
-        dist.scatter_add_(1, high.unsqueeze(1), w_high.unsqueeze(1))
+
+        # MPS scatter_add_ segfaults with duplicate indices (when low == high).
+        # Build distribution with boolean masks instead.
+        idx = torch.arange(num_bins, device=v.device).unsqueeze(0)  # (1, num_bins)
+        low_mask = (idx == low.unsqueeze(1)).float()               # (B, num_bins)
+        high_mask = (idx == high.unsqueeze(1)).float()             # (B, num_bins)
+        dist = low_mask * (1 - w_high).unsqueeze(1) + high_mask * w_high.unsqueeze(1)
         return dist
