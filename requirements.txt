@@ -4,26 +4,69 @@
 #
 #    pip-compile requirements.in
 #
-filelock==3.25.2
+blinker==1.9.0
+    # via flask
+chess==1.11.2
+    # via -r requirements.in
+click==8.3.3
+    # via flask
+cloudpickle==3.1.2
+    # via
+    #   tensordict
+    #   torchrl
+filelock==3.29.0
     # via torch
-fsspec==2026.3.0
+flask==3.1.3
+    # via -r requirements.in
+fsspec==2026.4.0
     # via torch
+importlib-metadata==9.0.0
+    # via tensordict
+itsdangerous==2.2.0
+    # via flask
 jinja2==3.1.6
-    # via torch
+    # via
+    #   flask
+    #   torch
 markupsafe==3.0.3
-    # via jinja2
+    # via
+    #   flask
+    #   jinja2
+    #   werkzeug
 mpmath==1.3.0
     # via sympy
 networkx==3.6.1
     # via torch
 numpy==2.4.4
-    # via -r requirements.in
+    # via
+    #   -r requirements.in
+    #   tensordict
+    #   torchrl
+packaging==26.2
+    # via
+    #   tensordict
+    #   torchrl
+pyvers==0.2.2
+    # via
+    #   tensordict
+    #   torchrl
 sympy==1.14.0
     # via torch
-torch==2.11.0
+tensordict==0.12.3
+    # via torchrl
+torch==2.12.0
+    # via
+    #   -r requirements.in
+    #   tensordict
+    #   torchrl
+torchrl==0.12.0
     # via -r requirements.in
 typing-extensions==4.15.0
     # via torch
+werkzeug==3.1.8
+    # via flask
+zipp==3.23.1
+    # via importlib-metadata
 
 # The following packages are considered to be unsafe in a requirements file:
 # setuptools

@@ -8,7 +8,7 @@ from checkpoint import latest_checkpoint, load_checkpoint, save_checkpoint
 from learner_worker import Learner
 from model import build_networks
 from player import SelfPlayWorker
-from replay_buffer import get_num_episodes
+from replay_buffer import get_num_episodes, load_replay_buffer, save_replay_buffer
 from training_logger import TrainingLogger
 
 
@@ -28,15 +28,17 @@ LOG_DIR = "logs"
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--resume", action="store_true", help="Resume from latest checkpoint if present.")
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume from latest checkpoint if present.",
+    )
     parser.add_argument("--max-steps", type=int, default=10_000)
-    parser.add_argument("--games-per-iter", type=int, default=4)
+    parser.add_argument("--games-per-iter", type=int, default=1)
     args = parser.parse_args()
 
     nets = build_networks(device=DEVICE)
-    learner = Learner(
-        nets.representation, nets.dynamics, nets.policy, nets.value
-    )
+    learner = Learner(nets.representation, nets.dynamics, nets.policy, nets.value)
     self_play_worker = SelfPlayWorker(nets)
     logger = TrainingLogger(log_dir=LOG_DIR)
 
@@ -48,6 +50,11 @@ def main():
             print(f"Resumed from {ckpt} at step {step}", flush=True)
         else:
             print("No checkpoint found; starting fresh.", flush=True)
+
+        if load_replay_buffer():
+            print(f"Loaded replay buffer: {get_num_episodes()} episodes", flush=True)
+        else:
+            print("No replay buffer found; starting fresh.", flush=True)
 
     print(f"Device: {DEVICE}", flush=True)
     print(
@@ -96,6 +103,8 @@ def main():
         final_path = os.path.join(CHECKPOINT_DIR, f"ckpt_{step}.pt")
         save_checkpoint(final_path, learner, step)
         print(f"Final checkpoint: {final_path}", flush=True)
+        save_replay_buffer()
+        print("Saved replay buffer.", flush=True)
         logger.close()
 
 

@@ -1,3 +1,4 @@
+import os
 from typing import List, Tuple
 import torch
 from collections import deque
@@ -11,6 +12,8 @@ from hyperparams import REPLAY_CAPACITY, TD_STEPS, UNROLL_STEPS
 # recomputing them from stored observations with the current network at training
 # time so the policy head always trains against up-to-date targets.
 Step = Tuple[torch.Tensor, int, int, torch.Tensor]
+
+REPLAY_BUFFER_PATH = "replay_buffer.pt"
 
 
 class EpisodeReplayBuffer:
@@ -141,6 +144,31 @@ class EpisodeReplayBuffer:
     def __len__(self) -> int:
         return self._total_steps
 
+    def save(self, path: str = REPLAY_BUFFER_PATH) -> None:
+        """Persist buffer to disk as a single .pt file."""
+        torch.save(
+            {
+                "episodes": list(self._episodes),
+                "total_steps": self._total_steps,
+                "max_episodes": self.max_episodes,
+            },
+            path,
+        )
+
+    def load(self, path: str = REPLAY_BUFFER_PATH) -> bool:
+        """Restore buffer from disk. Returns True if loaded."""
+        if not os.path.exists(path):
+            return False
+        data = torch.load(path, map_location="cpu", weights_only=False)
+        episodes = data.get("episodes", [])
+        self.max_episodes = data.get("max_episodes", self.max_episodes)
+        # Trim to max capacity in case max_episodes was lowered
+        if len(episodes) > self.max_episodes:
+            episodes = episodes[-self.max_episodes :]
+        self._episodes = deque(episodes, maxlen=self.max_episodes)
+        self._total_steps = sum(ep.batch_size[0] for ep in self._episodes)
+        return True
+
 
 rb = EpisodeReplayBuffer(max_episodes=10_000)
 
@@ -155,3 +183,11 @@ def get_num_episodes() -> int:
 
 def sample_batch(batch_size: int = 128) -> TensorDict:
     return rb.sample(batch_size)
+
+
+def save_replay_buffer(path: str = REPLAY_BUFFER_PATH) -> None:
+    rb.save(path)
+
+
+def load_replay_buffer(path: str = REPLAY_BUFFER_PATH) -> bool:
+    return rb.load(path)

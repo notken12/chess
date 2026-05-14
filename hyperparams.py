@@ -1,5 +1,5 @@
 REPLAY_CAPACITY = int(1e6)
-BATCH_SIZE = 256
+BATCH_SIZE = 64
 # Chess terminal rewards arrive only at the end of the game, so no discounting
 # within the K-step window is necessary.
 GAMMA = 1.0
