@@ -11,6 +11,7 @@ from player import SelfPlayWorker
 from replay_buffer import get_num_episodes, load_replay_buffer, save_replay_buffer
 from training_logger import TrainingLogger
 
+torch.mps.synchronize()
 
 DEVICE = torch.device(
     "cuda"
